@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""
-EOSE Put Hedge Analyzer v3 - AI-Powered Options Recommendation Engine
-======================================================================
-
-EXPERT HEDGE FUND MANAGER + SR SOFTWARE ENGINEER APPROACH:
-
-This script uses live options data to recommend optimal put hedge positions
-based on:
-- Forward-projected Bollinger Bands (expected move window)
-- Probability analysis (likelihood of different price scenarios)
-- Cost efficiency metrics (protection per dollar spent)
-- Expected value calculations
-- Real-time options chain data from Yahoo Finance
-
-KEY FEATURES:
-1. Fetches LIVE options chain data
-2. Analyzes expected moves vs available strikes
-3. Recommends optimal put spreads/positions
-4. Calculates cost-benefit ratios
-5. Shows correlation between expected moves and available options
-"""
 
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -28,9 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from matplotlib import ticker
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from scipy import stats
+from scipy.stats import norm
 
 # =================== CONFIGURATION ===================
 
@@ -38,32 +19,7 @@ TICKER = "EOSE"
 SHARES_HELD = 400
 INSURANCE_BUDGET = 100  # Target budget for hedge
 MAX_DAYS_TO_EXPIRATION = 180  # Look at options expiring within this many days
-
-# Optional: Your current positions (will be compared against recommendations)
-CURRENT_POSITIONS = [
-    {
-        "label": "7d 11P",
-        "strike": 11.0,
-        "days_to_exp": 7,
-        "premium": 0.16,
-        "contracts": 3,
-    },
-    {
-        "label": "14d 9P",
-        "strike": 9.0,
-        "days_to_exp": 14,
-        "premium": 0.08,
-        "contracts": 6,
-    },
-    {
-        "label": "23d 8P",
-        "strike": 8.0,
-        "days_to_exp": 23,
-        "premium": 0.15,
-        "contracts": 5,
-    },
-]
-
+DROP_SCENARIO_PCT = 0.50
 LOOKBACK_DAYS = 365
 DATA_FILE = Path("eose_daily.parquet")
 
@@ -93,7 +49,6 @@ def load_price_history(
             df = pd.read_parquet(cache_file)
             df.index = pd.to_datetime(df.index, format="%Y-%m-%d")
         except Exception as e:
-            print(f"⚠️  Cache read failed ({e}), redownloading...")
             try:
                 cache_file.unlink()
             except FileNotFoundError:
@@ -101,7 +56,6 @@ def load_price_history(
             df = None
 
     if df is None or df.empty:
-        print(f"📥 Downloading {ticker} price data...")
         df = yf.download(
             ticker,
             start=start_date,
@@ -110,11 +64,9 @@ def load_price_history(
             progress=False,
         )
         df.to_parquet(cache_file)
-        print(f"✅ Downloaded {len(df)} days of data")
     else:
         last_date = df.index[-1].normalize()
         if last_date < today:
-            print(f"🔄 Updating cache (last date: {last_date.date()})...")
             new = yf.download(
                 ticker,
                 start=last_date + pd.Timedelta(days=1),
@@ -127,7 +79,6 @@ def load_price_history(
                 df = pd.concat([df, new])
                 # df.to_csv(cache_file)
                 df.to_parquet(cache_file)
-                print(f"✅ Added {len(new)} new days")
 
     cutoff = today - pd.Timedelta(days=lookback_days)
     df = df[df.index >= cutoff]
@@ -140,15 +91,11 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
     Returns DataFrame with all put options within max_dte days.
     """
     try:
-        print(f"📡 Fetching live options chain for {ticker}...")
         ticker_obj = yf.Ticker(ticker)
         expirations = ticker_obj.options
 
         if not expirations:
-            print("❌ No options data available for this ticker")
             return None
-
-        print(f"   Found {len(expirations)} expiration dates")
 
         all_puts = []
         today = pd.Timestamp.today().normalize()
@@ -176,27 +123,20 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
                     all_puts.append(puts)
 
             except Exception as e:
-                print(f"   ⚠️  Error fetching {exp_date_str}: {e}")
                 continue
 
         if all_puts:
             combined = pd.concat(all_puts, ignore_index=True)
-            print(f"✅ Fetched {len(combined)} put options within {max_dte} days")
             return combined
         else:
-            print("❌ No put options found within specified date range")
             return None
 
     except Exception as e:
-        print(f"❌ Error fetching options chain: {e}")
         return None
 
 
 # =================== MAIN DATA LOAD ===================
 
-print(f"\n{'=' * 80}")
-print("🚀 EOSE HEDGE ANALYZER - AI-POWERED OPTIONS RECOMMENDATION ENGINE")
-print(f"{'=' * 80}\n")
 
 df = load_price_history(TICKER, LOOKBACK_DAYS, DATA_FILE)
 
@@ -415,10 +355,6 @@ def recommend_optimal_hedge(
     if options_df is None or options_df.empty:
         return []
 
-    print(f"\n{'=' * 80}")
-    print(f"🔍 ANALYZING {len(options_df)} PUT OPTIONS...")
-    print(f"{'=' * 80}")
-
     # Analyze all puts
     analyzed_puts = []
     for idx, row in options_df.iterrows():
@@ -516,7 +452,6 @@ if options_df is not None and not options_df.empty:
     )
 else:
     recommendations = []
-    print("⚠️  Using current positions for analysis (no live options data)")
 
 # =================== PORTFOLIO P/L CALCULATIONS ===================
 
@@ -556,61 +491,11 @@ def portfolio_pl_at_price(
     }
 
 
-# Use recommendations if available, otherwise use current positions
-if recommendations:
-    puts_to_analyze = recommendations
-    puts_label = "RECOMMENDED"
-else:
-    puts_to_analyze = CURRENT_POSITIONS
-    puts_label = "CURRENT"
-
-# Convert current positions format if needed
-if puts_label == "CURRENT":
-    converted_positions = []
-    for pos in puts_to_analyze:
-        exp_date = today + pd.Timedelta(days=pos["days_to_exp"])
-        converted_positions.append(
-            {
-                "strike": pos["strike"],
-                "premium": pos["premium"],
-                "contracts": pos["contracts"],
-                "dte": pos["days_to_exp"],
-                "exp_date": exp_date,
-            }
-        )
-    puts_to_analyze = converted_positions
-
 # =================== PRINT ANALYSIS ===================
-
-print(f"\n{'=' * 80}")
-print(f"📊 {TICKER} HEDGE ANALYSIS - {puts_label} POSITIONS")
-print(f"{'=' * 80}")
-print(f"Current price:        ${current_price:.2f}")
-print(f"Shares held:          {SHARES_HELD:,}")
-print(f"Expected move range:  ${expected_low:.2f} - ${expected_high:.2f}")
-print(f"Annual volatility:    {annual_vol * 100:.1f}%")
-print(f"Budget target:        ${INSURANCE_BUDGET:,.0f}")
-
-if recommendations:
-    total_rec_cost = sum(r["cost"] for r in recommendations)
-    print("\n💰 RECOMMENDED HEDGE POSITIONS:")
-    print(f"{'─' * 80}")
-    print(
-        f"{'Strike':<8} {'Premium':<10} {'Contracts':<10} {'DTE':<6} {'Cost':<12} {'Efficiency':<12} {'ITM Prob':<10}"
-    )
-    print(f"{'-' * 80}")
-    for rec in recommendations:
-        print(
-            f"${rec['strike']:>6.2f}  ${rec['premium']:>8.2f}  {rec['contracts']:>9}  "
-            f"{rec['dte']:>4}d  ${rec['cost']:>10,.0f}  {rec['efficiency_score']:>10.1f}  {rec['prob_itm'] * 100:>7.1f}%"
-        )
-    print(f"{'-' * 80}")
-    print(f"{'TOTAL':<50} ${total_rec_cost:>10,.0f}")
-    print(f"{'=' * 80}\n")
 
 # Calculate scenario analysis
 scenario_price_50_down = 0.5 * current_price
-scenario_hedged = portfolio_pl_at_price(scenario_price_50_down, puts_to_analyze)
+scenario_hedged = portfolio_pl_at_price(scenario_price_50_down, recommendations)
 scenario_unhedged = portfolio_pl_at_price(scenario_price_50_down, [])
 
 hedge_benefit = scenario_hedged["total"] - scenario_unhedged["total"]
@@ -620,16 +505,6 @@ protection_pct = (
     else 0
 )
 
-print(f"\n📉 50% DROP SCENARIO (price → ${scenario_price_50_down:.2f}):")
-print(f"{'─' * 80}")
-print(f"  Unhedged P/L:       ${scenario_unhedged['total']:>12,.0f}")
-print(f"  Hedged P/L:         ${scenario_hedged['total']:>12,.0f}")
-print(f"  └─ Stock loss:      ${scenario_hedged['stock']:>12,.0f}")
-print(f"  └─ Options gain:    ${scenario_hedged['options']:>12,.0f}")
-print(f"  └─ Premium paid:    ${scenario_hedged['premium_paid']:>12,.0f}")
-print(f"\n  💡 Hedge benefit:   ${hedge_benefit:>12,.0f}")
-print(f"  💡 Protection:      {protection_pct:>11.1f}% of unhedged loss")
-print(f"{'=' * 80}\n")
 
 # =================== VISUALIZATIONS ===================
 
@@ -688,7 +563,6 @@ prob_expected_high = (
 
 # Calculate and plot percentile lines within the orange expected move area
 # Using normal distribution to calculate price levels at different percentiles
-from scipy.stats import norm
 
 t = FORWARD_PROJECTION_DAYS / 252.0
 sigma = annual_vol
@@ -744,7 +618,7 @@ ax1.axhline(
 
 # Overlay recommended/current put strikes
 strike_colors = ["#F18F01", "#C73E1D", "#6A994E", "#8B5CF6", "#06A77D"]
-for i, pos in enumerate(puts_to_analyze):
+for i, pos in enumerate(recommendations):
     strike = pos["strike"]
     exp_date = pos.get("exp_date", today + pd.Timedelta(days=pos.get("dte", 0)))
     label = f"{pos.get('dte', 'N/A')}d Put @ ${strike:.1f}"
@@ -775,7 +649,7 @@ ax1.axhline(
 )
 
 ax1.set_title(
-    f"{TICKER} Price History with Forward Projections & {puts_label} Put Strikes",
+    f"{TICKER} Price History with Forward Projections & Put Strikes",
     fontsize=14,
     fontweight="bold",
 )
@@ -787,7 +661,7 @@ ax1.grid(True, alpha=0.3)
 ax2 = fig.add_subplot(gs[1, 0])
 prices = np.linspace(current_price * 0.1, current_price * 1.6, 500)
 pl_stock_only = [portfolio_pl_at_price(p, [])["total"] for p in prices]
-pl_with_hedge = [portfolio_pl_at_price(p, puts_to_analyze)["total"] for p in prices]
+pl_with_hedge = [portfolio_pl_at_price(p, recommendations)["total"] for p in prices]
 
 ax2.plot(
     prices,
@@ -801,7 +675,7 @@ ax2.plot(
 ax2.plot(
     prices,
     pl_with_hedge,
-    label=f"Hedged ({puts_label})",
+    label=f"Hedged",
     linewidth=2.5,
     color="#06A77D",
     linestyle="-",
@@ -821,6 +695,10 @@ ax2.axvline(
 ax2.set_title("P/L Comparison: Hedged vs Unhedged", fontsize=12, fontweight="bold")
 ax2.set_xlabel(f"{TICKER} Price ($)", fontsize=10)
 ax2.set_ylabel("Net P/L ($)", fontsize=10)
+ax2.xaxis.set_major_locator(ticker.AutoLocator())
+ax2.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+ax2.yaxis.set_major_locator(ticker.AutoLocator())
+ax2.yaxis.set_minor_locator(ticker.AutoMinorLocator())
 ax2.legend(loc="best", fontsize=9)
 ax2.grid(True, alpha=0.3)
 
@@ -911,7 +789,7 @@ else:
 # ===== PLOT 4: Probability Distribution =====
 ax4 = fig.add_subplot(gs[2, :])
 price_range = np.linspace(current_price * 0.5, current_price * 1.5, 200)
-max_dte = max([p.get("dte", 30) for p in puts_to_analyze]) if puts_to_analyze else 30
+max_dte = max([p.get("dte", 30) for p in recommendations]) if recommendations else 30
 probabilities = [
     calculate_price_probability(p, current_price, max_dte, daily_vol, annual_vol) * 100
     for p in price_range
@@ -943,7 +821,7 @@ ax4.axvspan(
     label="Projected BB Range",
 )
 
-for pos in puts_to_analyze:
+for pos in recommendations:
     strike = pos["strike"]
     dte = pos.get("dte", max_dte)
     prob = (
@@ -976,7 +854,7 @@ y_pos = 0.7
 bar_height = 0.12
 spacing = 0.22
 
-for i, pos in enumerate(puts_to_analyze):
+for i, pos in enumerate(recommendations):
     strike = pos["strike"]
     premium = pos.get("premium", 0)
     contracts = pos.get("contracts", 0)
@@ -1014,12 +892,12 @@ for i, pos in enumerate(puts_to_analyze):
 
     y_pos -= spacing
 
-summary_text = f"{puts_label} Positions | Total Cost: USD {scenario_hedged['premium_paid']:,.0f} | "
+summary_text = f"Positions | Total Cost: USD {scenario_hedged['premium_paid']:,.0f} | "
 summary_text += f"Hedge Benefit at 50% Drop: USD {hedge_benefit:,.0f} | Annual Vol: {annual_vol * 100:.1f}%"
 ax5.text(
     0.5,
     0.95,
-    f"{puts_label} PUT POSITIONS",
+    f"PUT POSITIONS",
     fontsize=14,
     fontweight="bold",
     ha="center",
@@ -1044,7 +922,6 @@ except:
 # =================== EXPORT TO PDF ===================
 
 pdf_filename = f"{TICKER}_hedge_analysis_{today.strftime('%Y%m%d')}.pdf"
-print(f"\n📄 Generating PDF report: {pdf_filename}...")
 
 with PdfPages(pdf_filename) as pdf:
     # Page 1: Executive Summary - APA Style (Black & White)
@@ -1609,7 +1486,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     for scenario_name, price_mult in scenarios:
         scenario_price = current_price * price_mult
         unhedged_pl = portfolio_pl_at_price(scenario_price, [])
-        hedged_pl = portfolio_pl_at_price(scenario_price, puts_to_analyze)
+        hedged_pl = portfolio_pl_at_price(scenario_price, recommendations)
         benefit = hedged_pl["total"] - unhedged_pl["total"]
         protection = (
             (benefit / abs(unhedged_pl["total"])) * 100
@@ -1738,7 +1615,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     )
 
     strike_colors = ["#F18F01", "#C73E1D", "#6A994E", "#8B5CF6", "#06A77D"]
-    for i, pos in enumerate(puts_to_analyze):
+    for i, pos in enumerate(recommendations):
         strike = pos["strike"]
         exp_date = pos.get("exp_date", today + pd.Timedelta(days=pos.get("dte", 0)))
         label = f"{pos.get('dte', 'N/A')}d Put @ ${strike:.1f}"
@@ -1769,12 +1646,17 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     )
 
     ax_price.set_title(
-        f"Figure 1: {TICKER} Price History with Forward Projections & {puts_label} Put Strikes",
+        f"Figure 1: {TICKER} Price History with Forward Projections & Put Strikes",
         fontsize=12,
         fontweight="bold",
     )
+    # add auto ticket increments for price y axis
+    ax_price.yaxis.set_major_locator(ticker.AutoLocator())
+    ax_price.yaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax_price.set_ylabel("Price ($)", fontsize=11)
     ax_price.set_xlabel("Date", fontsize=11)
+    ax_price.xaxis.set_major_locator(ticker.AutoLocator())
+    ax_price.xaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax_price.legend(loc="best", fontsize=8, ncol=2)
     ax_price.grid(True, alpha=0.3)
 
@@ -1788,7 +1670,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
 
     prices = np.linspace(current_price * 0.1, current_price * 1.6, 500)
     pl_stock_only = [portfolio_pl_at_price(p, [])["total"] for p in prices]
-    pl_with_hedge = [portfolio_pl_at_price(p, puts_to_analyze)["total"] for p in prices]
+    pl_with_hedge = [portfolio_pl_at_price(p, recommendations)["total"] for p in prices]
 
     ax_pl.plot(
         prices,
@@ -1802,7 +1684,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pl.plot(
         prices,
         pl_with_hedge,
-        label=f"Hedged ({puts_label})",
+        label=f"Hedged",
         linewidth=2.5,
         color="#06A77D",
         linestyle="-",
@@ -1831,6 +1713,10 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     )
     ax_pl.set_xlabel(f"{TICKER} Price ($)", fontsize=12)
     ax_pl.set_ylabel("Net P/L ($)", fontsize=12)
+    ax_pl.xaxis.set_major_locator(ticker.AutoLocator())
+    ax_pl.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+    ax_pl.yaxis.set_major_locator(ticker.AutoLocator())
+    ax_pl.yaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax_pl.legend(loc="best", fontsize=10)
     ax_pl.grid(True, alpha=0.3)
 
@@ -1908,6 +1794,10 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         )
         ax_eff.set_xlabel("Strike Price ($)", fontsize=11)
         ax_eff.set_ylabel("Efficiency Score", fontsize=11)
+        ax_eff.xaxis.set_major_locator(ticker.AutoLocator())
+        ax_eff.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+        ax_eff.yaxis.set_major_locator(ticker.AutoLocator())
+        ax_eff.yaxis.set_minor_locator(ticker.AutoMinorLocator())
         ax_eff.legend(loc="best", fontsize=9)
         ax_eff.grid(True, alpha=0.3)
 
@@ -1921,7 +1811,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
 
     price_range = np.linspace(current_price * 0.5, current_price * 1.5, 200)
     max_dte = (
-        max([p.get("dte", 30) for p in puts_to_analyze]) if puts_to_analyze else 30
+        max([p.get("dte", 30) for p in recommendations]) if recommendations else 30
     )
     probabilities = [
         calculate_price_probability(p, current_price, max_dte, daily_vol, annual_vol)
@@ -1957,7 +1847,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         label="Projected BB Range",
     )
 
-    for pos in puts_to_analyze:
+    for pos in recommendations:
         strike = pos["strike"]
         dte = pos.get("dte", max_dte)
         prob = (
@@ -1983,6 +1873,10 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     )
     ax_prob.set_xlabel(f"{TICKER} Price ($)", fontsize=11)
     ax_prob.set_ylabel("Probability (%)", fontsize=11)
+    ax_prob.xaxis.set_major_locator(ticker.AutoLocator())
+    ax_prob.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+    ax_prob.yaxis.set_major_locator(ticker.AutoLocator())
+    ax_prob.yaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax_prob.legend(loc="best", fontsize=9)
     ax_prob.grid(True, alpha=0.3)
 
@@ -1999,7 +1893,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pos.text(
         0.5,
         0.96,
-        f"{puts_label} Hedge Positions: Detailed Analysis",
+        f"Hedge Positions: Detailed Analysis",
         fontsize=16,
         fontweight="bold",
         ha="center",
@@ -2032,7 +1926,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     headers1 = ["Pos", "Strike", "Expiration", "DTE", "Contracts"]
     headers2 = ["Pos", "Premium", "Cost", "ITM%", "Value@50%", "ROI%"]
 
-    for i, pos in enumerate(puts_to_analyze):
+    for i, pos in enumerate(recommendations):
         strike = pos["strike"]
         premium = pos.get("premium", 0)
         contracts = pos.get("contracts", 0)
@@ -2073,21 +1967,21 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
 
     # Add total rows
     total_cost = sum(
-        p.get("premium", 0) * 100 * p.get("contracts", 0) for p in puts_to_analyze
+        p.get("premium", 0) * 100 * p.get("contracts", 0) for p in recommendations
     )
     total_value_50 = (
         sum(
             max(p.get("strike", 0) - scenario_price_50_down, 0)
             * 100
             * p.get("contracts", 0)
-            for p in puts_to_analyze
+            for p in recommendations
         )
         - total_cost
     )
     total_ratio = (
         f"{(total_value_50 / total_cost) * 100:.1f}" if total_cost > 0 else "N/A"
     )
-    total_contracts = sum(p.get("contracts", 0) for p in puts_to_analyze)
+    total_contracts = sum(p.get("contracts", 0) for p in recommendations)
 
     table1_data.append(["TOT", "-", "-", "-", f"{total_contracts}"])
 
@@ -2318,13 +2212,8 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_pos, bbox_inches="tight", facecolor="white")
     plt.close(fig_pos)
 
-print(f"✅ PDF report saved: {pdf_filename}\n")
 
 # Optionally show interactive plots (comment out if you only want PDF)
 # plt.show()
-
-print("✅ Analysis complete! Review recommendations above.\n")
-if recommendations:
-    print(
-        "💡 RECOMMENDATION: Consider implementing the recommended positions for optimal cost efficiency.\n"
-    )
+print("PDF created successfully")
+exit()
