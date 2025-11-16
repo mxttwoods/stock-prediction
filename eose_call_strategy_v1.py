@@ -273,6 +273,16 @@ future_dates, proj_sma, proj_bb_up, proj_bb_dn = project_bollinger_bands_forward
 expected_low = proj_bb_dn[-1]
 expected_high = proj_bb_up[-1]
 
+# Confirm basic assumptions before recommending trades
+model_is_sound = run_model_sanity_checks(
+    "EOSE Call Strategy v1",
+    current_price,
+    annual_vol,
+    options_df,
+    CALL_INVESTMENT_BUDGET,
+    SHARES_HELD,
+)
+
 # =================== PROBABILITY CALCULATIONS ===================
 
 
@@ -307,6 +317,40 @@ def calculate_call_itm_probability(
     prob = 1 - stats.norm.cdf(z_score)
 
     return max(0.0, min(1.0, prob))
+
+
+def run_model_sanity_checks(
+    model_name: str,
+    current_price: float,
+    annual_vol: float,
+    options_df: Optional[pd.DataFrame],
+    budget: float,
+    shares_held: int,
+) -> bool:
+    """Simple guardrails to ensure the inputs look reasonable."""
+
+    issues = []
+
+    if current_price <= 0:
+        issues.append("Spot price must be positive")
+    if annual_vol <= 0 or annual_vol > 5:
+        issues.append("Volatility input looks off (check data)")
+    if shares_held <= 0:
+        issues.append("Share count must be positive")
+    if budget <= 0:
+        issues.append("Capital allocation for calls must be positive")
+    if options_df is None or options_df.empty:
+        issues.append("No live options data available – recommendations will be stale")
+
+    if issues:
+        print(f"\n⚠️  {model_name} sanity checks flagged:")
+        for issue in issues:
+            print(f"   • {issue}")
+        print("   Proceed, but double-check assumptions before trading.")
+        return False
+
+    print(f"\n✅ {model_name} sanity checks: inputs look sound.")
+    return True
 
 
 # =================== OPTIONS ANALYSIS & RECOMMENDATIONS ===================
@@ -481,6 +525,17 @@ def portfolio_pl_at_price(
     }
 
 
+def total_premium_spent(positions: List[Dict]) -> float:
+    """Helper for reporting capital deployed into calls (in dollars)."""
+
+    total = 0.0
+    for pos in positions:
+        contracts = pos.get("contracts", 0)
+        premium = pos.get("premium", 0.0)
+        total += premium * 100 * contracts
+    return total
+
+
 calls_to_analyze = recommendations if recommendations else CURRENT_POSITIONS
 calls_label = "RECOMMENDED" if recommendations else "CURRENT"
 
@@ -536,13 +591,494 @@ print(f"\n  💡 Return enhancement: ${return_enhancement:>12,.0f}")
 print(f"  💡 Enhancement:      {enhancement_pct:.1f}% over stock-only profit")
 print(f"{'=' * 80}\n")
 
+premium_spent = total_premium_spent(calls_to_analyze)
+
+scenario_levels = [
+    ("10% Rally", 1.10),
+    ("25% Rally", 1.25),
+    ("50% Rally", 1.50),
+    ("75% Rally", 1.75),
+    ("100% Rally", 2.00),
+]
+
+scenario_table_data = []
+for label, multiple in scenario_levels:
+    scenario_price = current_price * multiple
+    unhedged = portfolio_pl_at_price(scenario_price, SHARES_HELD, [])
+    hedged = portfolio_pl_at_price(scenario_price, SHARES_HELD, calls_to_analyze)
+    alpha = hedged["total"] - unhedged["total"]
+    capture_pct = (
+        (hedged["options"] / max(1.0, hedged["total"])) * 100
+        if hedged["total"] != 0
+        else 0
+    )
+    scenario_table_data.append(
+        {
+            "label": label,
+            "price": scenario_price,
+            "stock_only": unhedged["total"],
+            "with_calls": hedged["total"],
+            "alpha": alpha,
+            "options_contrib_pct": capture_pct,
+        }
+    )
+
 # =================== VISUALIZATIONS ===================
 
 pdf_filename = f"{TICKER}_call_strategy_analysis_{today.strftime('%Y%m%d')}.pdf"
 print(f"\n📄 Generating PDF report: {pdf_filename}...")
 
-with PdfPages(pdf_filename) as pdf:
-    # Page 1: Main Chart
+
+def add_summary_page(
+    pdf,
+    current_price,
+    shares_held,
+    expected_low,
+    expected_high,
+    annual_vol,
+    budget,
+    scenario_stock_only,
+    scenario_with_calls,
+    return_enhancement,
+    enhancement_pct,
+    today,
+    model_is_sound,
+):
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    status_text = "MODEL CHECK: PASS" if model_is_sound else "MODEL CHECK: REVIEW INPUTS"
+    status_color = "#0EAD69" if model_is_sound else "#D62828"
+
+    ax.text(
+        0.5,
+        0.93,
+        "Call Upside Capture Summary",
+        ha="center",
+        fontsize=16,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.88,
+        f"Analysis Date: {today.strftime('%B %d, %Y')}",
+        ha="center",
+        fontsize=11,
+        transform=ax.transAxes,
+        color="#555555",
+    )
+    ax.text(
+        0.5,
+        0.84,
+        status_text,
+        ha="center",
+        fontsize=11,
+        fontweight="bold",
+        color=status_color,
+        transform=ax.transAxes,
+    )
+
+    portfolio_value = current_price * shares_held
+
+    left_metrics = [
+        ("Current Price", f"${current_price:.2f}"),
+        ("Shares Held", f"{shares_held:,}"),
+        ("Portfolio Value", f"${portfolio_value:,.0f}"),
+    ]
+    right_metrics = [
+        ("Expected High", f"${expected_high:.2f}"),
+        ("Expected Low", f"${expected_low:.2f}"),
+        ("Annual Volatility", f"{annual_vol * 100:.1f}%"),
+    ]
+
+    y = 0.75
+    for label, value in left_metrics:
+        ax.text(0.15, y, f"{label}:", fontsize=11, transform=ax.transAxes)
+        ax.text(
+            0.38,
+            y,
+            value,
+            fontsize=11,
+            weight="bold",
+            transform=ax.transAxes,
+        )
+        y -= 0.05
+
+    y = 0.75
+    for label, value in right_metrics:
+        ax.text(0.55, y, f"{label}:", fontsize=11, transform=ax.transAxes)
+        ax.text(
+            0.78,
+            y,
+            value,
+            fontsize=11,
+            weight="bold",
+            transform=ax.transAxes,
+        )
+        y -= 0.05
+
+    y -= 0.02
+    ax.text(
+        0.12,
+        y,
+        "50% Rally Stress Test",
+        fontsize=12,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    y -= 0.05
+    ax.text(
+        0.12,
+        y,
+        "Stock-only P/L:",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.42,
+        y,
+        f"${scenario_stock_only['total']:,.0f}",
+        fontsize=11,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    y -= 0.045
+    ax.text(
+        0.12,
+        y,
+        "With Calls P/L:",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.42,
+        y,
+        f"${scenario_with_calls['total']:,.0f}",
+        fontsize=11,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    y -= 0.045
+    ax.text(
+        0.12,
+        y,
+        "Return Enhancement:",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.42,
+        y,
+        f"${return_enhancement:,.0f} (+{enhancement_pct:.1f}%)",
+        fontsize=11,
+        fontweight="bold",
+        transform=ax.transAxes,
+        color="#0EAD69",
+    )
+
+    ax.text(
+        0.12,
+        0.30,
+        "Playbook",
+        fontsize=12,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.12,
+        0.25,
+        "• Lean into upside tails while keeping capital deployment disciplined",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.12,
+        0.21,
+        "• Focus on strikes inside projected band to harvest convexity",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.12,
+        0.17,
+        "• Rebalance when realized vol or drift deviates materially",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def add_recommendations_page(pdf, recommendations, calls_label, budget, premium_spent):
+    if not recommendations:
+        return
+
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    ax.text(
+        0.5,
+        0.93,
+        "Recommended Call Positions",
+        ha="center",
+        fontsize=16,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.89,
+        f"{calls_label.title()} Calls vs. ${budget:,.0f} Budget",
+        ha="center",
+        fontsize=11,
+        color="#555555",
+        transform=ax.transAxes,
+    )
+
+    rec_table_data = []
+    for rec in recommendations:
+        rec_table_data.append(
+            [
+                f"${rec['strike']:.2f}",
+                f"${rec['premium']:.2f}",
+                f"{rec['contracts']}",
+                f"{rec['dte']}d",
+                rec["expiration"],
+                f"${rec['cost']:,.0f}",
+                f"{rec['prob_itm'] * 100:.1f}%",
+                f"{rec['efficiency_score']:.1f}",
+            ]
+        )
+
+    total_cost = sum(r["cost"] for r in recommendations)
+    rec_table_data.append(
+        ["TOTAL", "-", "-", "-", "-", f"${total_cost:,.0f}", "-", "-"]
+    )
+
+    table = ax.table(
+        cellText=rec_table_data,
+        colLabels=[
+            "Strike",
+            "Premium",
+            "Contracts",
+            "DTE",
+            "Expiration",
+            "Cost",
+            "ITM Prob",
+            "Efficiency",
+        ],
+        loc="center",
+        cellLoc="center",
+        bbox=[0.08, 0.25, 0.84, 0.55],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.8)
+
+    ax.text(
+        0.08,
+        0.18,
+        f"Capital Deployed: ${premium_spent:,.0f}  |  Budget Utilization: {premium_spent / budget * 100 if budget else 0:.1f}%",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def add_metrics_page(
+    pdf,
+    daily_vol,
+    annual_vol,
+    expected_low,
+    expected_high,
+    bb_lower,
+    bb_upper,
+    budget,
+    premium_spent,
+):
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    ax.text(
+        0.5,
+        0.92,
+        "Market Technicals",
+        ha="center",
+        fontsize=16,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+
+    metrics = [
+        ("Daily Volatility", f"{daily_vol * 100:.2f}%"),
+        ("Annualized Vol", f"{annual_vol * 100:.2f}%"),
+        ("Bollinger Upper", f"${bb_upper:.2f}"),
+        ("Bollinger Lower", f"${bb_lower:.2f}"),
+        ("Projected High", f"${expected_high:.2f}"),
+        ("Projected Low", f"${expected_low:.2f}"),
+        ("Call Budget", f"${budget:,.0f}"),
+        ("Premium Currently Deployed", f"${premium_spent:,.0f}"),
+    ]
+
+    table = ax.table(
+        cellText=[[m[0], m[1]] for m in metrics],
+        colLabels=["Metric", "Value"],
+        loc="center",
+        cellLoc="left",
+        bbox=[0.2, 0.25, 0.6, 0.5],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 2.2)
+
+    for i in range(2):
+        table[(0, i)].set_facecolor("#404040")
+        table[(0, i)].set_text_props(color="white", weight="bold")
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def add_opportunity_page(
+    pdf,
+    scenario_with_calls,
+    scenario_stock_only,
+    return_enhancement,
+    enhancement_pct,
+    shares_held,
+    current_price,
+    premium_spent,
+    budget,
+):
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    ax.text(
+        0.5,
+        0.92,
+        "Upside Opportunity & Capital Discipline",
+        ha="center",
+        fontsize=16,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+
+    portfolio_value = current_price * shares_held
+    budget_pct = (premium_spent / portfolio_value) * 100 if portfolio_value else 0
+
+    data = [
+        ["Stock-only P/L", f"${scenario_stock_only['total']:,.0f}"],
+        ["With Calls P/L", f"${scenario_with_calls['total']:,.0f}"],
+        ["Return Enhancement", f"${return_enhancement:,.0f} (+{enhancement_pct:.1f}%)"],
+        ["Premium Deployed", f"${premium_spent:,.0f}"],
+        ["Budget", f"${budget:,.0f}"],
+        ["Capital at Risk", f"{budget_pct:.2f}% of equity value"],
+    ]
+
+    table = ax.table(
+        cellText=data,
+        colLabels=["Item", "Value"],
+        cellLoc="left",
+        loc="center",
+        bbox=[0.2, 0.25, 0.6, 0.5],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 2.2)
+
+    for i in range(2):
+        table[(0, i)].set_facecolor("#404040")
+        table[(0, i)].set_text_props(color="white", weight="bold")
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def add_scenarios_page(pdf, scenario_table_data):
+    if not scenario_table_data:
+        return
+
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    ax.text(
+        0.5,
+        0.92,
+        "Upside Scenario Analysis",
+        ha="center",
+        fontsize=16,
+        fontweight="bold",
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.88,
+        "How much convexity are we capturing as the tape rips higher?",
+        ha="center",
+        fontsize=11,
+        color="#555555",
+        transform=ax.transAxes,
+    )
+
+    table_data = [
+        [
+            row["label"],
+            f"${row['price']:.2f}",
+            f"${row['stock_only']:,.0f}",
+            f"${row['with_calls']:,.0f}",
+            f"${row['alpha']:,.0f}",
+            f"{row['options_contrib_pct']:.1f}%",
+        ]
+        for row in scenario_table_data
+    ]
+
+    table = ax.table(
+        cellText=table_data,
+        colLabels=[
+            "Scenario",
+            "Price",
+            "Stock-only P/L",
+            "With Calls P/L",
+            "Excess Return",
+            "Options Contribution",
+        ],
+        loc="center",
+        cellLoc="center",
+        bbox=[0.08, 0.25, 0.84, 0.5],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.9)
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def add_visual_dashboard_page(
+    pdf,
+    df,
+    close,
+    future_dates,
+    proj_sma,
+    proj_bb_up,
+    proj_bb_dn,
+    expected_high,
+    current_price,
+    calls_to_analyze,
+    calls_label,
+    options_df,
+    recommendations,
+    annual_vol,
+):
     fig = plt.figure(figsize=(20, 16))
     gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3, height_ratios=[2.5, 2, 2, 1.5])
 
@@ -615,7 +1151,6 @@ with PdfPages(pdf_filename) as pdf:
     ax1.legend(loc="best", fontsize=8, ncol=3)
     ax1.grid(True, alpha=0.3)
 
-    # P/L Comparison
     ax2 = fig.add_subplot(gs[1, 0])
     prices = np.linspace(current_price * 0.8, current_price * 1.8, 500)
     pl_stock_only = [portfolio_pl_at_price(p, SHARES_HELD, [])["total"] for p in prices]
@@ -648,7 +1183,6 @@ with PdfPages(pdf_filename) as pdf:
     ax2.legend(loc="best", fontsize=9)
     ax2.grid(True, alpha=0.3)
 
-    # Options Efficiency
     ax3 = fig.add_subplot(gs[1, 1])
     if options_df is not None and not options_df.empty:
         analyzed_df = pd.DataFrame(
@@ -690,7 +1224,6 @@ with PdfPages(pdf_filename) as pdf:
         ax3.legend(loc="best", fontsize=8)
         ax3.grid(True, alpha=0.3)
 
-    # Probability Distribution
     ax4 = fig.add_subplot(gs[2, :])
     price_range = np.linspace(current_price * 0.8, current_price * 1.8, 200)
     max_dte = (
@@ -752,5 +1285,65 @@ with PdfPages(pdf_filename) as pdf:
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+
+with PdfPages(pdf_filename) as pdf:
+    add_summary_page(
+        pdf,
+        current_price,
+        SHARES_HELD,
+        expected_low,
+        expected_high,
+        annual_vol,
+        CALL_INVESTMENT_BUDGET,
+        scenario_stock_only,
+        scenario_with_calls,
+        return_enhancement,
+        enhancement_pct,
+        today,
+        model_is_sound,
+    )
+    add_recommendations_page(
+        pdf, recommendations, calls_label, CALL_INVESTMENT_BUDGET, premium_spent
+    )
+    add_metrics_page(
+        pdf,
+        daily_vol,
+        annual_vol,
+        expected_low,
+        expected_high,
+        bb_lower,
+        bb_upper,
+        CALL_INVESTMENT_BUDGET,
+        premium_spent,
+    )
+    add_opportunity_page(
+        pdf,
+        scenario_with_calls,
+        scenario_stock_only,
+        return_enhancement,
+        enhancement_pct,
+        SHARES_HELD,
+        current_price,
+        premium_spent,
+        CALL_INVESTMENT_BUDGET,
+    )
+    add_scenarios_page(pdf, scenario_table_data)
+    add_visual_dashboard_page(
+        pdf,
+        df,
+        close,
+        future_dates,
+        proj_sma,
+        proj_bb_up,
+        proj_bb_dn,
+        expected_high,
+        current_price,
+        calls_to_analyze,
+        calls_label,
+        options_df,
+        recommendations,
+        annual_vol,
+    )
 
 print("✅ PDF report generated successfully.")

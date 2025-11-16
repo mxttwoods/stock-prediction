@@ -302,6 +302,15 @@ future_dates, proj_sma, proj_bb_up, proj_bb_dn = project_bollinger_bands_forward
 expected_low = proj_bb_dn[-1]
 expected_high = proj_bb_up[-1]
 
+model_is_sound = run_model_sanity_checks(
+    "EOSE Put Hedge Analyzer v3",
+    current_price,
+    annual_vol,
+    options_df,
+    INSURANCE_BUDGET,
+    SHARES_HELD,
+)
+
 # =================== PROBABILITY CALCULATIONS ===================
 
 
@@ -342,6 +351,39 @@ def calculate_price_probability(
     prob = stats.norm.cdf(z_score)
 
     return max(0.0, min(1.0, prob))  # Clamp to [0, 1]
+
+
+def run_model_sanity_checks(
+    model_name: str,
+    current_price: float,
+    annual_vol: float,
+    options_df: Optional[pd.DataFrame],
+    budget: float,
+    shares_held: int,
+) -> bool:
+    """Keep the hedge process honest before allocating capital."""
+
+    issues = []
+
+    if current_price <= 0:
+        issues.append("Spot price must be positive")
+    if annual_vol <= 0 or annual_vol > 5:
+        issues.append("Volatility input looks out of bounds")
+    if shares_held <= 0:
+        issues.append("Share count must be positive")
+    if budget <= 0:
+        issues.append("Insurance budget must be positive")
+    if options_df is None or options_df.empty:
+        issues.append("No live options data – hedge analysis may be stale")
+
+    if issues:
+        print(f"\n⚠️  {model_name} sanity checks flagged:")
+        for issue in issues:
+            print(f"   • {issue}")
+        return False
+
+    print(f"\n✅ {model_name} sanity checks: inputs look sound.")
+    return True
 
 
 # =================== OPTIONS ANALYSIS & RECOMMENDATIONS ===================
@@ -1093,10 +1135,23 @@ with PdfPages(pdf_filename) as pdf:
         color="black",
     )
 
+    status_text = "Model Check: PASS" if model_is_sound else "Model Check: REVIEW INPUTS"
+    status_color = "#0EAD69" if model_is_sound else "#D62828"
+    ax_summary.text(
+        0.5,
+        0.885,
+        status_text,
+        ha="center",
+        fontsize=10,
+        fontweight="bold",
+        transform=fig_summary.transFigure,
+        color=status_color,
+    )
+
     # Draw separator line
     line = plt.Line2D(
         [0.1, 0.9],
-        [0.88, 0.88],
+        [0.86, 0.86],
         transform=fig_summary.transFigure,
         color="black",
         linewidth=0.5,
