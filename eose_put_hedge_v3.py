@@ -21,6 +21,7 @@ KEY FEATURES:
 5. Shows correlation between expected moves and available options
 """
 
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -301,7 +302,7 @@ def calculate_price_probability(
     daily_vol: float,
     annual_vol: float,
 ) -> float:
-    """Calculate probability of reaching target price within given days."""
+    """Probability that price settles *below* target_price within given days."""
     if days <= 0:
         return 0.0
 
@@ -309,7 +310,7 @@ def calculate_price_probability(
     mu = 0  # No drift assumption
     sigma = annual_vol
 
-    log_ratio = np.log(target_price / current_price)
+    log_ratio = np.log(max(target_price, 1e-6) / max(current_price, 1e-6))
     mean_log = (mu - 0.5 * sigma**2) * t
     var_log = sigma**2 * t
 
@@ -317,9 +318,10 @@ def calculate_price_probability(
         return 0.5 if abs(target_price - current_price) < 0.01 else 0.0
 
     z_score = (log_ratio - mean_log) / np.sqrt(var_log)
-    prob = 1 - stats.norm.cdf(z_score)
+    prob = stats.norm.cdf(z_score)
 
-    return prob
+    # Numerical guard rails
+    return float(np.clip(prob, 0.0, 1.0))
 
 
 # =================== OPTIONS ANALYSIS & RECOMMENDATIONS ===================
@@ -367,12 +369,24 @@ def analyze_put_option(
     # Protection per dollar (efficiency metric)
     protection_per_dollar = avg_protection / premium if premium > 0 else 0
 
-    # Expected value (probability weighted)
-    # Simplified: prob_itm * avg_intrinsic - premium
-    expected_value = prob_itm * avg_protection - premium
+    # Hedge coverage assumptions
+    shares_per_contract = min(100, shares_held) if shares_held > 0 else 0
+    coverage_ratio = shares_per_contract / shares_held if shares_held > 0 else 0
+    coverage_adjusted_protection = avg_protection * shares_per_contract
+
+    # Expected value metrics
+    expected_value_per_share = prob_itm * avg_protection - premium
+    expected_value_per_contract = (
+        prob_itm * avg_protection * shares_per_contract - cost_per_contract
+    )
 
     # Cost efficiency score (higher is better)
     efficiency_score = protection_per_dollar * prob_itm * 100
+    coverage_efficiency_score = (
+        (coverage_adjusted_protection / cost_per_contract) * prob_itm * 100
+        if cost_per_contract > 0
+        else 0
+    )
 
     # Distance from current price
     distance_pct = ((strike - current_price) / current_price) * 100
@@ -385,10 +399,14 @@ def analyze_put_option(
         "expiration": put_row["expiration"],
         "prob_itm": prob_itm,
         "protection_per_dollar": protection_per_dollar,
-        "expected_value": expected_value,
+        "expected_value": expected_value_per_share,
+        "expected_value_per_contract": expected_value_per_contract,
         "efficiency_score": efficiency_score,
+        "coverage_efficiency_score": coverage_efficiency_score,
         "distance_pct": distance_pct,
         "cost_per_contract": cost_per_contract,
+        "shares_per_contract": shares_per_contract,
+        "coverage_ratio": coverage_ratio,
         "volume": int(put_row["volume"]) if "volume" in put_row else 0,
         "open_interest": int(put_row["openInterest"])
         if "openInterest" in put_row
@@ -440,12 +458,19 @@ def recommend_optimal_hedge(
     # 2. Reasonable liquidity (volume or open interest)
     # 3. Within budget constraints
 
-    # Focus on strikes that would be in-the-money if price drops to expected low
+    # Focus on strikes that would be in-the-money if price drops toward the
+    # projected downside and that have tradable liquidity.
+    downside_anchor = min(expected_low * 1.05, current_price * 0.9)
+    min_liquidity = 25
     protective_puts = analyzed_df[
-        (analyzed_df["strike"] >= expected_low * 0.9)  # Not too far OTM
-        & (analyzed_df["strike"] <= current_price * 0.95)  # Below current price
+        (analyzed_df["strike"] <= current_price * 0.95)
+        & (analyzed_df["strike"] <= downside_anchor)
         & (analyzed_df["premium"] > 0)
         & (analyzed_df["efficiency_score"] > 0)
+        & (
+            (analyzed_df["volume"] >= min_liquidity)
+            | (analyzed_df["open_interest"] >= min_liquidity)
+        )
     ].copy()
 
     if protective_puts.empty:
@@ -454,35 +479,56 @@ def recommend_optimal_hedge(
             (analyzed_df["strike"] <= current_price) & (analyzed_df["premium"] > 0)
         ].copy()
 
-    # Sort by efficiency score
-    protective_puts = protective_puts.sort_values("efficiency_score", ascending=False)
+    # Sort by coverage-aware efficiency score when available
+    sort_key = (
+        "coverage_efficiency_score"
+        if "coverage_efficiency_score" in protective_puts
+        else "efficiency_score"
+    )
+    protective_puts = protective_puts.sort_values(sort_key, ascending=False)
 
     # Recommend positions within budget
     recommendations = []
     total_cost = 0.0
+    remaining_shares_to_cover = shares_held
+    max_contracts_total = math.ceil(shares_held / 100) if shares_held > 0 else 0
+    remaining_contract_capacity = max_contracts_total
 
     # Strategy: Recommend a ladder of puts at different strikes/expirations
     # This provides protection across time and price levels
 
     # Group by expiration to get variety
     for exp_date in protective_puts["exp_date"].unique()[:4]:  # Top 4 expirations
+        if remaining_contract_capacity <= 0 or remaining_shares_to_cover <= 0:
+            break
+
         exp_puts = protective_puts[protective_puts["exp_date"] == exp_date]
 
         # Get best strike for this expiration
         best_put = exp_puts.iloc[0]
 
-        # Calculate how many contracts we can afford
+        # Calculate how many contracts we can afford and still need
         cost_per_contract = best_put["cost_per_contract"]
         remaining_budget = budget - total_cost
 
         if cost_per_contract > 0 and remaining_budget >= cost_per_contract:
+            affordable_contracts = int(remaining_budget / cost_per_contract)
+            coverage_limited_contracts = math.ceil(
+                max(remaining_shares_to_cover, 0) / 100
+            )
             contracts = min(
-                int(remaining_budget / cost_per_contract), int(shares_held / 100)
-            )  # Don't over-hedge
+                affordable_contracts,
+                remaining_contract_capacity,
+                coverage_limited_contracts,
+            )
 
             if contracts > 0:
                 position_cost = cost_per_contract * contracts
                 total_cost += position_cost
+                remaining_contract_capacity -= contracts
+                remaining_shares_to_cover = max(
+                    remaining_shares_to_cover - contracts * 100, 0
+                )
 
                 recommendations.append(
                     {
@@ -496,6 +542,9 @@ def recommend_optimal_hedge(
                         "efficiency_score": best_put["efficiency_score"],
                         "prob_itm": best_put["prob_itm"],
                         "protection_per_dollar": best_put["protection_per_dollar"],
+                        "coverage_efficiency_score": best_put.get(
+                            "coverage_efficiency_score", best_put["efficiency_score"]
+                        ),
                     }
                 )
 
