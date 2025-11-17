@@ -19,12 +19,16 @@ from scipy.stats import norm
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="EOSE hedge analysis tool")
-    parser.add_argument("--config", type=Path, help="Path to JSON config file", default=None)
-    parser.add_argument("--ticker", type=str, default="EOSE", help="Ticker symbol to analyze")
+    parser = argparse.ArgumentParser(description="Hedge analysis tool")
+    parser.add_argument(
+        "--config", type=Path, help="Path to JSON config file", default=None
+    )
+    parser.add_argument(
+        "--ticker", type=str, default="ONDS", help="Ticker symbol to analyze"
+    )
     parser.add_argument("--shares", type=int, default=400, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=125, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -38,14 +42,17 @@ def parse_cli_args():
     parser.add_argument(
         "--drop-scenarios",
         type=str,
-        default="10,25,50,75",
+        default="10,25,50,75,90",
         help="Comma-separated drop percentages for scenario analysis (e.g., 10,25,50)",
     )
     parser.add_argument(
         "--bb-window", type=int, default=20, help="Lookback window for Bollinger Bands"
     )
     parser.add_argument(
-        "--bb-std", type=float, default=2.0, help="Standard deviations for Bollinger Bands"
+        "--bb-std",
+        type=float,
+        default=2.0,
+        help="Standard deviations for Bollinger Bands",
     )
     parser.add_argument(
         "--forward-days",
@@ -95,7 +102,7 @@ DROP_SCENARIOS = [
     if x
 ]
 
-DATA_FILE = Path(file_config.get("data_file", "eose_daily.parquet"))
+DATA_FILE = Path(file_config.get("data_file", "data_file.parquet"))
 
 # Bollinger Band parameters
 BB_WINDOW = int(file_config.get("bb_window", cli_args.bb_window))
@@ -120,7 +127,8 @@ def load_price_history(
     """Load daily price data with CSV caching."""
     today = pd.Timestamp.today().normalize()
     start_date = today - pd.Timedelta(days=lookback_days + 5)
-
+    cache_file = ticker.lower() + "_" + str(cache_file)
+    cache_file = Path(cache_file)
     df = None
 
     if cache_file.exists():
@@ -129,7 +137,7 @@ def load_price_history(
             # df.index = pd.to_datetime(df.index)
             df = pd.read_parquet(cache_file)
             df.index = pd.to_datetime(df.index, format="%Y-%m-%d")
-        except Exception as e:
+        except Exception:
             try:
                 cache_file.unlink()
             except FileNotFoundError:
@@ -203,7 +211,7 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
 
                     all_puts.append(puts)
 
-            except Exception as e:
+            except Exception:
                 continue
 
         if all_puts:
@@ -212,7 +220,7 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
         else:
             return None
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -497,7 +505,7 @@ def recommend_optimal_hedge(
     # This provides protection across time and price levels
 
     # Group by expiration to get variety
-    for exp_date in protective_puts["exp_date"].unique()[:4]:  # Top 4 expirations
+    for exp_date in protective_puts["exp_date"].unique():
         exp_puts = protective_puts[protective_puts["exp_date"] == exp_date]
 
         # Get best strike for this expiration
@@ -837,7 +845,7 @@ ax2.plot(
 ax2.plot(
     prices,
     pl_with_hedge,
-    label=f"Hedged",
+    label="Hedged",
     linewidth=2.5,
     color="#06A77D",
     linestyle="-",
@@ -957,25 +965,6 @@ probabilities = [
     for p in price_range
 ]
 
-output_dir = Path("outputs")
-output_dir.mkdir(exist_ok=True)
-
-if recommendations:
-    rec_df = pd.DataFrame(recommendations)
-    rec_df.to_csv(output_dir / f"{TICKER.lower()}_hedge_recommendations.csv", index=False)
-    rec_df.to_json(output_dir / f"{TICKER.lower()}_hedge_recommendations.json", orient="records")
-
-scenario_df = pd.DataFrame(scenario_results)
-scenario_df.to_csv(output_dir / f"{TICKER.lower()}_hedge_scenarios.csv", index=False)
-scenario_df.to_json(output_dir / f"{TICKER.lower()}_hedge_scenarios.json", orient="records")
-
-prob_df = pd.DataFrame({"price": price_range, "probability_pct": probabilities})
-prob_df.to_csv(output_dir / f"{TICKER.lower()}_probability_curve.csv", index=False)
-
-if not backtest_df.empty:
-    backtest_df.to_csv(output_dir / f"{TICKER.lower()}_hedge_backtest.csv", index=False)
-    backtest_df.to_json(output_dir / f"{TICKER.lower()}_hedge_backtest.json", orient="records")
-
 ax4.plot(
     price_range,
     probabilities,
@@ -1081,7 +1070,7 @@ summary_text += f"Hedge Benefit at {worst_drop_pct:.0f}% Drop: USD {hedge_benefi
 ax5.text(
     0.5,
     0.95,
-    f"PUT POSITIONS",
+    "PUT POSITIONS",
     fontsize=14,
     fontweight="bold",
     ha="center",
@@ -1655,8 +1644,12 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         for idx, benefit in enumerate(sorted_bt["benefit"]):
             ax_bt_chart.text(
                 idx,
-                max(sorted_bt["hedged_total"].iloc[idx], sorted_bt["unhedged_total"].iloc[idx])
-                + 0.02 * abs(sorted_bt[["hedged_total", "unhedged_total"]]).values.max(),
+                max(
+                    sorted_bt["hedged_total"].iloc[idx],
+                    sorted_bt["unhedged_total"].iloc[idx],
+                )
+                + 0.02
+                * abs(sorted_bt[["hedged_total", "unhedged_total"]]).values.max(),
                 f"$ {benefit:,.0f}",
                 ha="center",
                 va="bottom",
@@ -1963,7 +1956,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pl.plot(
         prices,
         pl_with_hedge,
-        label=f"Hedged",
+        label="Hedged",
         linewidth=2.5,
         color="#06A77D",
         linestyle="-",
@@ -2172,7 +2165,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pos.text(
         0.5,
         0.96,
-        f"Hedge Positions: Detailed Analysis",
+        "Hedge Positions: Detailed Analysis",
         fontsize=16,
         fontweight="bold",
         ha="center",
@@ -2228,9 +2221,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
             )
             * 100
         )
-        protection_ratio = (
-            f"{(net_value_drop / cost) * 100:.1f}" if cost > 0 else "N/A"
-        )
+        protection_ratio = f"{(net_value_drop / cost) * 100:.1f}" if cost > 0 else "N/A"
 
         table1_data.append(
             [
