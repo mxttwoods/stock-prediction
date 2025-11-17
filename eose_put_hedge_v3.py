@@ -23,6 +23,11 @@ DROP_SCENARIO_PCT = 0.50
 LOOKBACK_DAYS = 365
 DATA_FILE = Path("eose_daily.parquet")
 
+# Liquidity preferences
+LIQUIDITY_MIN_VOLUME = 5
+LIQUIDITY_MIN_OI = 50
+MAX_BID_ASK_SPREAD = 0.6  # Dollars
+
 # Bollinger Band parameters
 BB_WINDOW = 20
 BB_STD = 2.0
@@ -198,18 +203,19 @@ def project_bollinger_bands_forward(current_price, sma, std, days_ahead, daily_v
     projected_bb_dn = []
 
     current_sma_val = sma.iloc[-1] if not pd.isna(sma.iloc[-1]) else current_price
-    current_std_val = (
-        std.iloc[-1] if not pd.isna(std.iloc[-1]) else daily_vol * current_price
-    )
+    base_price_std = daily_vol * current_price
 
     for i in range(days_ahead):
         current_sma_val += recent_trend
-        time_factor = 1 + (i / days_ahead) * 0.1
-        current_std_val = current_std_val * time_factor
+
+        # Use square-root-of-time scaling on volatility to keep projections aligned
+        # with lognormal price diffusion assumptions rather than deterministic growth.
+        horizon = i + 1
+        projected_std = base_price_std * np.sqrt(horizon)
 
         projected_sma.append(current_sma_val)
-        projected_bb_up.append(current_sma_val + BB_STD * current_std_val)
-        projected_bb_dn.append(current_sma_val - BB_STD * current_std_val)
+        projected_bb_up.append(current_sma_val + BB_STD * projected_std)
+        projected_bb_dn.append(current_sma_val - BB_STD * projected_std)
 
     return (
         future_dates,
@@ -238,15 +244,15 @@ def calculate_price_probability(
     target_price: float,
     current_price: float,
     days: int,
-    daily_vol: float,
     annual_vol: float,
+    risk_free_rate: float = 0.0,
 ) -> float:
     """Calculate probability of reaching target price within given days."""
     if days <= 0:
         return 0.0
 
     t = days / 252.0
-    mu = 0  # No drift assumption
+    mu = risk_free_rate
     sigma = annual_vol
 
     log_ratio = np.log(target_price / current_price)
@@ -257,7 +263,7 @@ def calculate_price_probability(
         return 0.5 if abs(target_price - current_price) < 0.01 else 0.0
 
     z_score = (log_ratio - mean_log) / np.sqrt(var_log)
-    prob = 1 - stats.norm.cdf(z_score)
+    prob = stats.norm.cdf(z_score)
 
     return prob
 
@@ -269,7 +275,6 @@ def analyze_put_option(
     put_row: pd.Series,
     current_price: float,
     shares_held: int,
-    daily_vol: float,
     annual_vol: float,
 ) -> Dict:
     """
@@ -277,29 +282,59 @@ def analyze_put_option(
     Returns metrics including cost efficiency, expected value, etc.
     """
     strike = float(put_row["strike"])
-    premium = (
-        float(put_row["lastPrice"])
-        if not pd.isna(put_row["lastPrice"])
-        else (float(put_row["bid"]) + float(put_row["ask"])) / 2
-    )
+    bid = float(put_row.get("bid", 0) or 0)
+    ask = float(put_row.get("ask", 0) or 0)
+    last = float(put_row.get("lastPrice", 0) or 0)
+
+    # Price at the offer to reflect realistic buy costs, with mid as a fallback
+    if ask > 0:
+        premium = ask
+    elif bid > 0 and ask == 0:
+        premium = bid
+    else:
+        premium = (bid + ask) / 2 if (bid + ask) > 0 else last
+
     dte = int(put_row["DTE"])
     exp_date = put_row["exp_date"]
 
+    implied_vol = float(put_row.get("impliedVolatility", np.nan))
+    vol_for_prob = implied_vol if implied_vol and not np.isnan(implied_vol) else annual_vol
+
     # Calculate metrics
     prob_itm = calculate_price_probability(
-        strike, current_price, dte, daily_vol, annual_vol
+        strike, current_price, dte, vol_for_prob
     )
 
     # Protection scenarios
     scenarios = [0.5, 0.6, 0.7, 0.8, 0.9]
     scenario_prices = [current_price * s for s in scenarios]
 
-    total_protection_value = 0.0
-    for scenario_price in scenario_prices:
-        intrinsic = max(strike - scenario_price, 0.0)
-        total_protection_value += intrinsic
+    log_sigma = vol_for_prob * np.sqrt(max(dte, 1) / 252)
+    log_mu = (0.0 - 0.5 * vol_for_prob**2) * (max(dte, 1) / 252)
 
-    avg_protection = total_protection_value / len(scenarios)
+    if log_sigma > 0:
+        cdfs = [
+            norm.cdf((np.log(price / current_price) - log_mu) / log_sigma)
+            for price in scenario_prices
+        ]
+        weights = []
+        prev = 0.0
+        for cdf_val in cdfs:
+            weights.append(max(cdf_val - prev, 0.0))
+            prev = cdf_val
+
+        weight_sum = sum(weights)
+        if weight_sum > 0:
+            weights = [w / weight_sum for w in weights]
+    else:
+        weights = [1 / len(scenarios)] * len(scenarios)
+
+    weighted_protection = 0.0
+    for scenario_price, weight in zip(scenario_prices, weights):
+        intrinsic = max(strike - scenario_price, 0.0)
+        weighted_protection += intrinsic * weight
+
+    avg_protection = weighted_protection if weights else 0.0
 
     # Cost per contract
     cost_per_contract = premium * 100
@@ -317,6 +352,16 @@ def analyze_put_option(
     # Distance from current price
     distance_pct = ((strike - current_price) / current_price) * 100
 
+    bid_ask_spread = ask - bid if ask > 0 and bid > 0 else np.nan
+    is_liquid = (
+        (bid > 0 and ask > 0)
+        and (np.isnan(bid_ask_spread) or bid_ask_spread <= MAX_BID_ASK_SPREAD)
+        and (
+            int(put_row.get("volume", 0)) >= LIQUIDITY_MIN_VOLUME
+            or int(put_row.get("openInterest", 0)) >= LIQUIDITY_MIN_OI
+        )
+    )
+
     return {
         "strike": strike,
         "premium": premium,
@@ -333,6 +378,11 @@ def analyze_put_option(
         "open_interest": int(put_row["openInterest"])
         if "openInterest" in put_row
         else 0,
+        "implied_volatility": vol_for_prob,
+        "bid": bid,
+        "ask": ask,
+        "bid_ask_spread": bid_ask_spread,
+        "is_liquid": is_liquid,
     }
 
 
@@ -359,9 +409,7 @@ def recommend_optimal_hedge(
     analyzed_puts = []
     for idx, row in options_df.iterrows():
         try:
-            analysis = analyze_put_option(
-                row, current_price, shares_held, daily_vol, annual_vol
-            )
+            analysis = analyze_put_option(row, current_price, shares_held, annual_vol)
             analyzed_puts.append(analysis)
         except Exception:
             continue
@@ -382,12 +430,15 @@ def recommend_optimal_hedge(
         & (analyzed_df["strike"] <= current_price * 0.95)  # Below current price
         & (analyzed_df["premium"] > 0)
         & (analyzed_df["efficiency_score"] > 0)
+        & (analyzed_df["is_liquid"])
     ].copy()
 
     if protective_puts.empty:
         # Fallback: use all puts sorted by efficiency
         protective_puts = analyzed_df[
-            (analyzed_df["strike"] <= current_price) & (analyzed_df["premium"] > 0)
+            (analyzed_df["strike"] <= current_price)
+            & (analyzed_df["premium"] > 0)
+            & (analyzed_df["is_liquid"])
         ].copy()
 
     # Sort by efficiency score
@@ -549,14 +600,14 @@ ax1.plot(
 # Calculate percentiles for forward projections
 prob_expected_low = (
     calculate_price_probability(
-        expected_low, current_price, FORWARD_PROJECTION_DAYS, daily_vol, annual_vol
+        expected_low, current_price, FORWARD_PROJECTION_DAYS, annual_vol
     )
     * 100
 )
 prob_expected_high = (
     100
     - calculate_price_probability(
-        expected_high, current_price, FORWARD_PROJECTION_DAYS, daily_vol, annual_vol
+        expected_high, current_price, FORWARD_PROJECTION_DAYS, annual_vol
     )
     * 100
 )
@@ -717,9 +768,7 @@ if options_df is not None and not options_df.empty:
     efficiencies = []
     for idx, row in options_df.iterrows():
         try:
-            analysis = analyze_put_option(
-                row, current_price, SHARES_HELD, daily_vol, annual_vol
-            )
+            analysis = analyze_put_option(row, current_price, SHARES_HELD, annual_vol)
             efficiencies.append(analysis["efficiency_score"])
         except:
             efficiencies.append(0)
@@ -791,7 +840,7 @@ ax4 = fig.add_subplot(gs[2, :])
 price_range = np.linspace(current_price * 0.5, current_price * 1.5, 200)
 max_dte = max([p.get("dte", 30) for p in recommendations]) if recommendations else 30
 probabilities = [
-    calculate_price_probability(p, current_price, max_dte, daily_vol, annual_vol) * 100
+    calculate_price_probability(p, current_price, max_dte, annual_vol) * 100
     for p in price_range
 ]
 
@@ -825,7 +874,7 @@ for pos in recommendations:
     strike = pos["strike"]
     dte = pos.get("dte", max_dte)
     prob = (
-        calculate_price_probability(strike, current_price, dte, daily_vol, annual_vol)
+        calculate_price_probability(strike, current_price, dte, annual_vol)
         * 100
     )
     ax4.axvline(strike, linestyle="--", alpha=0.6, linewidth=1)
@@ -865,7 +914,7 @@ for i, pos in enumerate(recommendations):
     intrinsic_50 = max(strike - scenario_price_50_down, 0) * 100 * contracts
     net_value_50 = intrinsic_50 - cost
     prob_itm = (
-        calculate_price_probability(strike, current_price, dte, daily_vol, annual_vol)
+        calculate_price_probability(strike, current_price, dte, annual_vol)
         * 100
     )
 
@@ -1814,7 +1863,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         max([p.get("dte", 30) for p in recommendations]) if recommendations else 30
     )
     probabilities = [
-        calculate_price_probability(p, current_price, max_dte, daily_vol, annual_vol)
+        calculate_price_probability(p, current_price, max_dte, annual_vol)
         * 100
         for p in price_range
     ]
@@ -1851,9 +1900,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         strike = pos["strike"]
         dte = pos.get("dte", max_dte)
         prob = (
-            calculate_price_probability(
-                strike, current_price, dte, daily_vol, annual_vol
-            )
+            calculate_price_probability(strike, current_price, dte, annual_vol)
             * 100
         )
         ax_prob.axvline(strike, linestyle="--", alpha=0.6, linewidth=1)
@@ -1937,9 +1984,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         intrinsic_50 = max(strike - scenario_price_50_down, 0) * 100 * contracts
         net_value_50 = intrinsic_50 - cost
         prob_itm = (
-            calculate_price_probability(
-                strike, current_price, dte, daily_vol, annual_vol
-            )
+            calculate_price_probability(strike, current_price, dte, annual_vol)
             * 100
         )
         protection_ratio = f"{(net_value_50 / cost) * 100:.1f}" if cost > 0 else "N/A"
