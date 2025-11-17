@@ -28,12 +28,12 @@ def parse_cli_args():
     )
     parser.add_argument("--shares", type=int, default=400, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=75, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
         type=int,
-        default=180,
+        default=365,
         help="Max days to expiration to include in options chain",
     )
     parser.add_argument(
@@ -61,15 +61,15 @@ def parse_cli_args():
         help="Number of business days for forward projection",
     )
     parser.add_argument(
-        "--min-volume", type=int, default=10, help="Minimum option volume filter"
+        "--min-volume", type=int, default=5, help="Minimum option volume filter"
     )
     parser.add_argument(
-        "--min-oi", type=int, default=50, help="Minimum open interest filter"
+        "--min-oi", type=int, default=25, help="Minimum open interest filter"
     )
     parser.add_argument(
         "--max-spread",
         type=float,
-        default=0.6,
+        default=0.8,
         help="Maximum bid/ask spread as a fraction of mid price",
     )
     return parser.parse_args()
