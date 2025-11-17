@@ -6,14 +6,17 @@ calls and puts are supported and results are filtered by budget, days to
 expiration, and a basic efficiency score.
 """
 
+import base64
+import io
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from flask import Flask, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 from scipy import stats
+from matplotlib import pyplot as plt
 
 app = Flask(__name__)
 
@@ -186,6 +189,18 @@ def analyze_option(
     }
 
 
+def put_drop_coverage(
+    strike: float, premium: float, current_price: float, shares_held: int, drop_pct: float = 0.5
+) -> Tuple[float, float]:
+    """Return per-contract payout and % coverage for a drop_pct shock."""
+
+    drop_price = current_price * (1 - drop_pct)
+    per_contract_payout = max(strike - drop_price, 0) * 100
+    target_loss = shares_held * current_price * drop_pct
+    pct = (per_contract_payout * max(int(shares_held / 100), 1)) / target_loss if target_loss else 0
+    return per_contract_payout, pct
+
+
 def recommend_options(
     options_df: pd.DataFrame,
     option_type: str,
@@ -234,6 +249,55 @@ def recommend_options(
     return candidates.to_dict(orient="records")
 
 
+def build_put_hedge_plan(
+    recommendations: List[Dict],
+    current_price: float,
+    shares_held: int,
+    budget: float,
+    drop_pct: float = 0.5,
+) -> Optional[Dict]:
+    if not recommendations:
+        return None
+
+    target_loss = shares_held * current_price * drop_pct
+    if target_loss <= 0:
+        return None
+
+    best = None
+    for rec in recommendations:
+        per_payout, _ = put_drop_coverage(rec["strike"], rec["premium"], current_price, shares_held, drop_pct)
+        if per_payout <= 0:
+            continue
+
+        max_contracts_budget = int(budget // rec["cost_per_contract"]) if rec["cost_per_contract"] else 0
+        if budget > 0 and max_contracts_budget <= 0:
+            continue
+
+        needed_contracts = max(int(np.ceil(shares_held / 100)), 1)
+        contracts = max(1, min(needed_contracts, max_contracts_budget or needed_contracts))
+
+        total_cost = contracts * rec["cost_per_contract"]
+        coverage = contracts * per_payout
+        coverage_pct = coverage / target_loss
+
+        record = {
+            "strike": rec["strike"],
+            "premium": rec["premium"],
+            "contracts": contracts,
+            "coverage": coverage,
+            "coverage_pct": coverage_pct,
+            "cost": total_cost,
+            "expiration": rec["expiration"],
+            "dte": rec["dte"],
+            "breakeven": rec["breakeven"],
+        }
+
+        if best is None or coverage_pct > best["coverage_pct"]:
+            best = record
+
+    return best
+
+
 def format_currency(value: float) -> str:
     return f"${value:,.2f}" if value or value == 0 else "-"
 
@@ -244,6 +308,47 @@ def format_pct(value: float) -> str:
 
 def format_prob(value: float) -> str:
     return f"{value*100:.1f}%" if value or value == 0 else "-"
+
+
+def render_price_chart_bytes(ticker: str, lookback: int, cache_file: Path) -> bytes:
+    df = load_price_history(ticker, lookback, cache_file)
+    if df.empty:
+        return b""
+
+    if isinstance(df.columns, pd.MultiIndex):
+        cols = df.columns.get_level_values(0)
+        close = df.xs("Adj Close", axis=1, level=0).iloc[:, 0] if "Adj Close" in set(cols) else df.xs("Close", axis=1, level=0).iloc[:, 0]
+    else:
+        close = df["Adj Close"].copy() if "Adj Close" in df.columns else df["Close"].copy()
+
+    sma = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    bb_up = sma + 2 * std
+    bb_dn = sma - 2 * std
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(close.index, close, label="Close", color="#0d6efd")
+    ax.plot(sma.index, sma, label="SMA20", color="#6c757d", linestyle="--")
+    ax.fill_between(bb_up.index, bb_up, bb_dn, color="#0d6efd", alpha=0.08, label="Bollinger ±2σ")
+
+    ax.set_title(f"{ticker} price with 20d bands")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.2)
+    ax.legend(loc="upper left")
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def price_chart_base64(ticker: str, lookback: int, cache_file: Path) -> str:
+    img_bytes = render_price_chart_bytes(ticker, lookback, cache_file)
+    if not img_bytes:
+        return ""
+    return base64.b64encode(img_bytes).decode("ascii")
 
 
 TEMPLATE = """
@@ -273,7 +378,7 @@ TEMPLATE = """
 </head>
 <body>
   <h1>Options Screener</h1>
-  <p class="muted">Screen calls or puts quickly with a lightweight Flask UI.</p>
+  <p class="muted">Screen calls or puts quickly with a lightweight Flask UI focused on hedge coverage.</p>
 
   <form method="post">
     <div class="grid">
@@ -319,6 +424,27 @@ TEMPLATE = """
   {% if summary %}
     <div class="card">
       <strong>{{ summary.ticker }}</strong> last close: {{ summary.price }} · Annual vol: {{ summary.vol }} · Options checked: {{ summary.count }}
+      <div class="muted" style="margin-top:0.25rem;">Planning for a 50% drop to {{ format_currency(summary.drop_price) }} across {{ form_values.shares_held }} shares (target loss {{ format_currency(summary.target_loss) }}).</div>
+    </div>
+  {% endif %}
+
+  {% if hedge_plan %}
+    <div class="card">
+      <strong>Hedge coverage preview</strong>
+      <p style="margin:0.4rem 0 0.2rem 0;">
+        Buying <strong>{{ hedge_plan.contracts }} × {{ hedge_plan.strike | round(2) }} puts</strong> expiring {{ hedge_plan.expiration }} costs {{ format_currency(hedge_plan.cost) }} and would pay about {{ format_currency(hedge_plan.coverage) }} if the stock drops 50%, covering {{ format_pct(hedge_plan.coverage_pct*100) }} of that loss. Breakeven: {{ format_currency(hedge_plan.breakeven) }} · {{ hedge_plan.dte }} days to expiration.
+      </p>
+      <p class="muted" style="margin:0;">Tune budget and DTE to push coverage closer to 100% with affordable strikes.</p>
+    </div>
+  {% elif recommendations and form_values.option_type == 'put' %}
+    <div class="card">We found choices, but none fit the budget well enough to outline a 50% drop hedge. Consider raising budget or lowering strike.</div>
+  {% endif %}
+
+  {% if chart_uri %}
+    <div class="card">
+      <strong>Recent price action</strong>
+      <div><img src="{{ chart_uri }}" alt="Price chart" style="max-width:100%;" /></div>
+      <div class="muted" style="margin-top:0.25rem;">Chart is also available as base64 from <code>/api/price_chart?ticker={{ form_values.ticker }}&lookback={{ form_values.lookback }}</code>.</div>
     </div>
   {% endif %}
 
@@ -368,6 +494,8 @@ def home():
     error = None
     recommendations: List[Dict] = []
     summary = None
+    hedge_plan = None
+    chart_uri = None
 
     form_values = {
         "ticker": request.form.get("ticker", "EOSE").strip().upper(),
@@ -412,11 +540,26 @@ def home():
                 annual_vol,
             )
 
+            if form_values["option_type"] == "put":
+                hedge_plan = build_put_hedge_plan(
+                    recommendations,
+                    current_price,
+                    form_values["shares_held"],
+                    form_values["budget"],
+                    drop_pct=0.5,
+                )
+
+            chart_b64 = price_chart_base64(ticker, form_values["lookback"], cache_file)
+            if chart_b64:
+                chart_uri = f"data:image/png;base64,{chart_b64}"
+
             summary = {
                 "ticker": ticker,
                 "price": format_currency(current_price),
                 "vol": format_pct(annual_vol * 100),
                 "count": len(options_df),
+                "target_loss": form_values["shares_held"] * current_price * 0.5,
+                "drop_price": current_price * 0.5,
             }
         except Exception as exc:
             error = str(exc)
@@ -427,10 +570,34 @@ def home():
         recommendations=recommendations,
         summary=summary,
         error=error,
+        hedge_plan=hedge_plan,
+        chart_uri=chart_uri,
         format_currency=format_currency,
         format_pct=format_pct,
         format_prob=format_prob,
     )
+
+
+@app.get("/chart.png")
+def chart_png():
+    ticker = request.args.get("ticker", "EOSE").upper()
+    lookback = int(request.args.get("lookback", 365) or 365)
+    cache_file = Path(f"{ticker.lower()}_daily.parquet")
+    img = render_price_chart_bytes(ticker, lookback, cache_file)
+    if not img:
+        return Response("", status=404)
+    return Response(img, mimetype="image/png")
+
+
+@app.get("/api/price_chart")
+def chart_base64():
+    ticker = request.args.get("ticker", "EOSE").upper()
+    lookback = int(request.args.get("lookback", 365) or 365)
+    cache_file = Path(f"{ticker.lower()}_daily.parquet")
+    img_b64 = price_chart_base64(ticker, lookback, cache_file)
+    if not img_b64:
+        return jsonify({"error": "unable to generate chart"}), 404
+    return jsonify({"ticker": ticker, "lookback": lookback, "image_base64": img_b64})
 
 
 @app.get("/health")
