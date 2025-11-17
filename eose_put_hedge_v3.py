@@ -506,6 +506,60 @@ protection_pct = (
 )
 
 
+def build_console_summary(
+    ticker: str,
+    current_price: float,
+    expected_low: float,
+    expected_high: float,
+    annual_vol: float,
+    recommendations: List[Dict],
+    hedge_benefit: float,
+    protection_pct: float,
+) -> str:
+    """Create a concise text summary of the hedge analysis for quick validation."""
+
+    lines = [
+        f"Ticker: {ticker}",
+        f"Current price: ${current_price:,.2f}",
+        f"Expected {FORWARD_PROJECTION_DAYS}-day range: ${expected_low:,.2f} - ${expected_high:,.2f}",
+        f"Annualized volatility (hist): {annual_vol * 100:.2f}%",
+    ]
+
+    if recommendations:
+        lines.append("Recommended hedge ladder:")
+        for rec in recommendations:
+            lines.append(
+                "  "
+                + f"{rec.get('dte', 0)}d put @ ${rec['strike']:.2f} × {rec['contracts']}"
+                + f" | premium ${rec['premium']:.2f} | cost ${rec['cost']:.0f}"
+            )
+    else:
+        lines.append("No eligible put options found for the configured filters.")
+
+    lines.append(
+        "Hedge benefit (50% drop): "
+        + f"${hedge_benefit:,.0f} ({protection_pct:.1f}% protection)"
+    )
+
+    return "\n".join(lines)
+
+
+console_summary = build_console_summary(
+    TICKER,
+    current_price,
+    expected_low,
+    expected_high,
+    annual_vol,
+    recommendations,
+    hedge_benefit,
+    protection_pct,
+)
+
+print("===== Hedge Model Quick Check =====")
+print(console_summary)
+print("===================================")
+
+
 # =================== VISUALIZATIONS ===================
 
 fig = plt.figure(figsize=(20, 16))
