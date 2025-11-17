@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import argparse
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -15,20 +17,106 @@ from scipy.stats import norm
 
 # =================== CONFIGURATION ===================
 
-TICKER = "EOSE"
-SHARES_HELD = 400
-INSURANCE_BUDGET = 100  # Target budget for hedge
-MAX_DAYS_TO_EXPIRATION = 180  # Look at options expiring within this many days
-DROP_SCENARIO_PCT = 0.50
-LOOKBACK_DAYS = 365
-DATA_FILE = Path("eose_daily.parquet")
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Hedge analysis tool")
+    parser.add_argument(
+        "--config", type=Path, help="Path to JSON config file", default=None
+    )
+    parser.add_argument(
+        "--ticker", type=str, default="EOSE", help="Ticker symbol to analyze"
+    )
+    parser.add_argument("--shares", type=int, default=400, help="Number of shares held")
+    parser.add_argument(
+        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
+    )
+    parser.add_argument(
+        "--max-dte",
+        type=int,
+        default=180,
+        help="Max days to expiration to include in options chain",
+    )
+    parser.add_argument(
+        "--lookback", type=int, default=365, help="Lookback window for price history"
+    )
+    parser.add_argument(
+        "--drop-scenarios",
+        type=str,
+        default="10,25,50,75,90",
+        help="Comma-separated drop percentages for scenario analysis (e.g., 10,25,50)",
+    )
+    parser.add_argument(
+        "--bb-window", type=int, default=20, help="Lookback window for Bollinger Bands"
+    )
+    parser.add_argument(
+        "--bb-std",
+        type=float,
+        default=2.0,
+        help="Standard deviations for Bollinger Bands",
+    )
+    parser.add_argument(
+        "--forward-days",
+        type=int,
+        default=30,
+        help="Number of business days for forward projection",
+    )
+    parser.add_argument(
+        "--min-volume", type=int, default=10, help="Minimum option volume filter"
+    )
+    parser.add_argument(
+        "--min-oi", type=int, default=50, help="Minimum open interest filter"
+    )
+    parser.add_argument(
+        "--max-spread",
+        type=float,
+        default=0.6,
+        help="Maximum bid/ask spread as a fraction of mid price",
+    )
+    return parser.parse_args()
+
+
+def load_config(config_path: Optional[Path]) -> Dict:
+    if not config_path:
+        return {}
+
+    try:
+        with config_path.open("r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+cli_args = parse_cli_args()
+file_config = load_config(cli_args.config)
+
+TICKER = file_config.get("ticker", cli_args.ticker)
+SHARES_HELD = int(file_config.get("shares", cli_args.shares))
+INSURANCE_BUDGET = float(file_config.get("budget", cli_args.budget))
+MAX_DAYS_TO_EXPIRATION = int(file_config.get("max_dte", cli_args.max_dte))
+LOOKBACK_DAYS = int(file_config.get("lookback", cli_args.lookback))
+DROP_SCENARIOS = [
+    float(x)
+    for x in str(file_config.get("drop_scenarios", cli_args.drop_scenarios))
+    .replace(" ", "")
+    .split(",")
+    if x
+]
+
+DATA_FILE = Path(file_config.get("data_file", "data_file.parquet"))
 
 # Bollinger Band parameters
-BB_WINDOW = 20
-BB_STD = 2.0
+BB_WINDOW = int(file_config.get("bb_window", cli_args.bb_window))
+BB_STD = float(file_config.get("bb_std", cli_args.bb_std))
 
 # Forward projection parameters
-FORWARD_PROJECTION_DAYS = 30
+FORWARD_PROJECTION_DAYS = int(
+    file_config.get("forward_projection_days", cli_args.forward_days)
+)
+
+# Liquidity filters
+MIN_VOLUME = int(file_config.get("min_volume", cli_args.min_volume))
+MIN_OPEN_INTEREST = int(file_config.get("min_oi", cli_args.min_oi))
+MAX_SPREAD_RATIO = float(file_config.get("max_spread", cli_args.max_spread))
 
 # =================== DATA LOADING ===================
 
@@ -39,7 +127,8 @@ def load_price_history(
     """Load daily price data with CSV caching."""
     today = pd.Timestamp.today().normalize()
     start_date = today - pd.Timedelta(days=lookback_days + 5)
-
+    cache_file = ticker.lower() + "_" + str(cache_file)
+    cache_file = Path(cache_file)
     df = None
 
     if cache_file.exists():
@@ -48,7 +137,7 @@ def load_price_history(
             # df.index = pd.to_datetime(df.index)
             df = pd.read_parquet(cache_file)
             df.index = pd.to_datetime(df.index, format="%Y-%m-%d")
-        except Exception as e:
+        except Exception:
             try:
                 cache_file.unlink()
             except FileNotFoundError:
@@ -122,7 +211,7 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
 
                     all_puts.append(puts)
 
-            except Exception as e:
+            except Exception:
                 continue
 
         if all_puts:
@@ -131,7 +220,7 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
         else:
             return None
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -277,11 +366,13 @@ def analyze_put_option(
     Returns metrics including cost efficiency, expected value, etc.
     """
     strike = float(put_row["strike"])
-    premium = (
-        float(put_row["lastPrice"])
-        if not pd.isna(put_row["lastPrice"])
-        else (float(put_row["bid"]) + float(put_row["ask"])) / 2
-    )
+    bid = float(put_row.get("bid", 0) or 0)
+    ask = float(put_row.get("ask", 0) or 0)
+    last_price = float(put_row.get("lastPrice", np.nan))
+    mid_price = (bid + ask) / 2 if (bid + ask) > 0 else np.nan
+    premium = last_price if not pd.isna(last_price) and last_price > 0 else mid_price
+    spread = abs(ask - bid)
+    spread_ratio = spread / mid_price if mid_price and mid_price > 0 else np.inf
     dte = int(put_row["DTE"])
     exp_date = put_row["exp_date"]
 
@@ -333,6 +424,12 @@ def analyze_put_option(
         "open_interest": int(put_row["openInterest"])
         if "openInterest" in put_row
         else 0,
+        "bid": bid,
+        "ask": ask,
+        "mid": mid_price,
+        "spread": spread,
+        "spread_ratio": spread_ratio,
+        "implied_vol": float(put_row.get("impliedVolatility", np.nan)),
     }
 
 
@@ -382,12 +479,19 @@ def recommend_optimal_hedge(
         & (analyzed_df["strike"] <= current_price * 0.95)  # Below current price
         & (analyzed_df["premium"] > 0)
         & (analyzed_df["efficiency_score"] > 0)
+        & (analyzed_df["volume"] >= MIN_VOLUME)
+        & (analyzed_df["open_interest"] >= MIN_OPEN_INTEREST)
+        & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
     ].copy()
 
     if protective_puts.empty:
         # Fallback: use all puts sorted by efficiency
         protective_puts = analyzed_df[
-            (analyzed_df["strike"] <= current_price) & (analyzed_df["premium"] > 0)
+            (analyzed_df["strike"] <= current_price)
+            & (analyzed_df["premium"] > 0)
+            & (analyzed_df["volume"] >= MIN_VOLUME)
+            & (analyzed_df["open_interest"] >= MIN_OPEN_INTEREST)
+            & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
         ].copy()
 
     # Sort by efficiency score
@@ -401,7 +505,7 @@ def recommend_optimal_hedge(
     # This provides protection across time and price levels
 
     # Group by expiration to get variety
-    for exp_date in protective_puts["exp_date"].unique()[:4]:  # Top 4 expirations
+    for exp_date in protective_puts["exp_date"].unique():
         exp_puts = protective_puts[protective_puts["exp_date"] == exp_date]
 
         # Get best strike for this expiration
@@ -494,9 +598,10 @@ def portfolio_pl_at_price(
 # =================== PRINT ANALYSIS ===================
 
 # Calculate scenario analysis
-scenario_price_50_down = 0.5 * current_price
-scenario_hedged = portfolio_pl_at_price(scenario_price_50_down, recommendations)
-scenario_unhedged = portfolio_pl_at_price(scenario_price_50_down, [])
+worst_drop_pct = max(DROP_SCENARIOS) if DROP_SCENARIOS else 50.0
+scenario_price_down = current_price * (1 - worst_drop_pct / 100)
+scenario_hedged = portfolio_pl_at_price(scenario_price_down, recommendations)
+scenario_unhedged = portfolio_pl_at_price(scenario_price_down, [])
 
 hedge_benefit = scenario_hedged["total"] - scenario_unhedged["total"]
 protection_pct = (
@@ -505,8 +610,127 @@ protection_pct = (
     else 0
 )
 
+# Calculate multiple drop scenarios for reporting & exports
+scenario_results = []
+for drop_pct in sorted(DROP_SCENARIOS):
+    scenario_price = current_price * (1 - drop_pct / 100)
+    unhedged = portfolio_pl_at_price(scenario_price, [])
+    hedged = portfolio_pl_at_price(scenario_price, recommendations)
+    scenario_results.append(
+        {
+            "drop_pct": drop_pct,
+            "scenario_price": scenario_price,
+            "unhedged_total": unhedged["total"],
+            "hedged_total": hedged["total"],
+            "benefit": hedged["total"] - unhedged["total"],
+            "protection_pct": (
+                (hedged["total"] - unhedged["total"]) / abs(unhedged["total"]) * 100
+                if unhedged["total"] < 0
+                else 0
+            ),
+        }
+    )
+
+
+def backtest_drawdowns(
+    price_series: pd.Series,
+    positions: List[Dict],
+    lookback_days: int = 180,
+    top_n: int = 8,
+    drop_threshold: float = 0.05,
+) -> pd.DataFrame:
+    """Evaluate hedge benefit across the worst daily drawdowns in recent history."""
+
+    if price_series.empty:
+        return pd.DataFrame()
+
+    recent = price_series.tail(lookback_days)
+    returns = recent.pct_change().dropna()
+    worst_returns = returns[returns <= -drop_threshold].nsmallest(
+        min(top_n, len(returns))
+    )
+
+    records = []
+    for drop_date, pct_change in worst_returns.items():
+        price_at_drop = recent.loc[drop_date]
+        unhedged = portfolio_pl_at_price(price_at_drop, [], target_date=drop_date)
+        hedged = portfolio_pl_at_price(price_at_drop, positions, target_date=drop_date)
+        records.append(
+            {
+                "date": drop_date.strftime("%Y-%m-%d"),
+                "pct_change": pct_change * 100,
+                "price": price_at_drop,
+                "unhedged_total": unhedged["total"],
+                "hedged_total": hedged["total"],
+                "benefit": hedged["total"] - unhedged["total"],
+                "protection_pct": (
+                    (hedged["total"] - unhedged["total"]) / abs(unhedged["total"]) * 100
+                    if unhedged["total"] < 0
+                    else 0
+                ),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def build_console_summary(
+    ticker: str,
+    current_price: float,
+    expected_low: float,
+    expected_high: float,
+    annual_vol: float,
+    recommendations: List[Dict],
+    hedge_benefit: float,
+    protection_pct: float,
+) -> str:
+    """Create a concise text summary of the hedge analysis for quick validation."""
+
+    lines = [
+        f"Ticker: {ticker}",
+        f"Current price: ${current_price:,.2f}",
+        f"Expected {FORWARD_PROJECTION_DAYS}-day range: ${expected_low:,.2f} - ${expected_high:,.2f}",
+        f"Annualized volatility (hist): {annual_vol * 100:.2f}%",
+    ]
+
+    if recommendations:
+        lines.append("Recommended hedge ladder:")
+        for rec in recommendations:
+            lines.append(
+                "  "
+                + f"{rec.get('dte', 0)}d put @ ${rec['strike']:.2f} × {rec['contracts']}"
+                + f" | premium ${rec['premium']:.2f} | cost ${rec['cost']:.0f}"
+            )
+    else:
+        lines.append("No eligible put options found for the configured filters.")
+
+    lines.append(
+        "Hedge benefit (50% drop): "
+        + f"${hedge_benefit:,.0f} ({protection_pct:.1f}% protection)"
+    )
+
+    return "\n".join(lines)
+
+
+console_summary = build_console_summary(
+    TICKER,
+    current_price,
+    expected_low,
+    expected_high,
+    annual_vol,
+    recommendations,
+    hedge_benefit,
+    protection_pct,
+)
+
+print("===== Hedge Model Quick Check =====")
+print(console_summary)
+print("===================================")
+
 
 # =================== VISUALIZATIONS ===================
+
+backtest_df = backtest_drawdowns(close, recommendations)
 
 fig = plt.figure(figsize=(20, 16))
 gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.3, height_ratios=[2.5, 2, 2, 1.5])
@@ -675,7 +899,7 @@ ax2.plot(
 ax2.plot(
     prices,
     pl_with_hedge,
-    label=f"Hedged",
+    label="Hedged",
     linewidth=2.5,
     color="#06A77D",
     linestyle="-",
@@ -862,8 +1086,8 @@ for i, pos in enumerate(recommendations):
     exp_date = pos.get("exp_date", today + pd.Timedelta(days=dte))
     cost = premium * 100 * contracts
 
-    intrinsic_50 = max(strike - scenario_price_50_down, 0) * 100 * contracts
-    net_value_50 = intrinsic_50 - cost
+    intrinsic_worst = max(strike - scenario_price_down, 0) * 100 * contracts
+    net_value_worst = intrinsic_worst - cost
     prob_itm = (
         calculate_price_probability(strike, current_price, dte, daily_vol, annual_vol)
         * 100
@@ -872,7 +1096,7 @@ for i, pos in enumerate(recommendations):
     x_start = 0.05
     x_width = 0.9
     y_start = y_pos - bar_height / 2
-    color = "#90EE90" if strike > scenario_price_50_down else "#FFB6C1"
+    color = "#90EE90" if strike > scenario_price_down else "#FFB6C1"
 
     rect = Rectangle(
         (x_start, y_start),
@@ -887,17 +1111,20 @@ for i, pos in enumerate(recommendations):
 
     strike_text = f"{dte}d Put @ ${strike:.1f} × {contracts} contracts | Exp: {exp_date.strftime('%Y-%m-%d')}"
     ax5.text(0.1, y_pos, strike_text, fontsize=9, fontweight="bold", va="center")
-    cost_text = f"Cost: USD {cost:,.0f} | At 50% drop: USD {net_value_50:,.0f} | ITM Prob: {prob_itm:.1f}%"
+    cost_text = (
+        f"Cost: USD {cost:,.0f} | At {worst_drop_pct:.0f}% drop: USD {net_value_worst:,.0f} | "
+        f"ITM Prob: {prob_itm:.1f}%"
+    )
     ax5.text(0.1, y_pos - 0.06, cost_text, fontsize=8, va="center")
 
     y_pos -= spacing
 
 summary_text = f"Positions | Total Cost: USD {scenario_hedged['premium_paid']:,.0f} | "
-summary_text += f"Hedge Benefit at 50% Drop: USD {hedge_benefit:,.0f} | Annual Vol: {annual_vol * 100:.1f}%"
+summary_text += f"Hedge Benefit at {worst_drop_pct:.0f}% Drop: USD {hedge_benefit:,.0f} | Annual Vol: {annual_vol * 100:.1f}%"
 ax5.text(
     0.5,
     0.95,
-    f"PUT POSITIONS",
+    "PUT POSITIONS",
     fontsize=14,
     fontweight="bold",
     ha="center",
@@ -921,7 +1148,7 @@ except:
 
 # =================== EXPORT TO PDF ===================
 
-pdf_filename = f"{TICKER}_hedge_analysis_v3_{today.strftime('%Y%m%d')}.pdf"
+pdf_filename = f"{TICKER}_hedge_analysis_v4_{today.strftime('%Y%m%d')}.pdf"
 
 with PdfPages(pdf_filename) as pdf:
     # Page 1: Executive Summary - APA Style (Black & White)
@@ -1031,7 +1258,7 @@ with PdfPages(pdf_filename) as pdf:
     ax_summary.text(
         0.12,
         y_pos,
-        "50% Price Decline Scenario Analysis",
+        f"{worst_drop_pct:.0f}% Price Decline Scenario Analysis",
         fontsize=12,
         fontweight="bold",
         transform=fig_summary.transFigure,
@@ -1397,7 +1624,10 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         ["Portfolio Value", f"\\${portfolio_value:,.0f}"],
         ["Position Size", f"{SHARES_HELD} shares"],
         ["Daily Value at Risk (1σ)", f"\\${daily_var:,.0f}"],
-        ["Expected Loss (50% drop)", f"\\${abs(scenario_unhedged['total']):,.0f}"],
+        [
+            f"Expected Loss ({worst_drop_pct:.0f}% drop)",
+            f"\\${abs(scenario_unhedged['total']):,.0f}",
+        ],
         ["Hedge Budget", f"\\${INSURANCE_BUDGET:,.0f}"],
         [
             "Budget as % of Portfolio",
@@ -1438,7 +1668,121 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_risk, bbox_inches="tight", facecolor="white")
     plt.close(fig_risk)
 
-    # Page 5: Downside Scenario Analysis
+    # Page 5: Historical Drawdown Backtest
+    if not backtest_df.empty:
+        fig_bt, (ax_bt_chart, ax_bt_table) = plt.subplots(
+            1, 2, figsize=(11, 8.5), gridspec_kw={"width_ratios": [1.3, 1]}
+        )
+
+        # Chart: Hedge benefit across worst drawdowns
+        sorted_bt = backtest_df.sort_values("date")
+        x = np.arange(len(sorted_bt))
+        width = 0.35
+
+        ax_bt_chart.bar(
+            x - width / 2,
+            sorted_bt["unhedged_total"],
+            width,
+            color="#D62828",
+            alpha=0.7,
+            label="Unhedged P/L",
+        )
+        ax_bt_chart.bar(
+            x + width / 2,
+            sorted_bt["hedged_total"],
+            width,
+            color="#06A77D",
+            alpha=0.75,
+            label="Hedged P/L",
+        )
+        for idx, benefit in enumerate(sorted_bt["benefit"]):
+            ax_bt_chart.text(
+                idx,
+                max(
+                    sorted_bt["hedged_total"].iloc[idx],
+                    sorted_bt["unhedged_total"].iloc[idx],
+                )
+                + 0.02
+                * abs(sorted_bt[["hedged_total", "unhedged_total"]]).values.max(),
+                f"$ {benefit:,.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=45,
+                color="#333333",
+            )
+
+        ax_bt_chart.set_title(
+            "Historical Drawdown Backtest", fontsize=12, fontweight="bold"
+        )
+        ax_bt_chart.set_ylabel("Net P/L ($)", fontsize=10)
+        ax_bt_chart.set_xticks(x)
+        ax_bt_chart.set_xticklabels(sorted_bt["date"], rotation=45, ha="right")
+        ax_bt_chart.legend(fontsize=8)
+        ax_bt_chart.grid(True, alpha=0.3, linestyle=":")
+
+        # Table: Detailed backtest metrics
+        ax_bt_table.axis("off")
+        bt_table_data = [
+            [
+                row["date"],
+                f"{row['pct_change']:.2f}%",
+                f"\\${row['price']:.2f}",
+                f"\\${row['unhedged_total']:,.0f}",
+                f"\\${row['hedged_total']:,.0f}",
+                f"\\${row['benefit']:,.0f}",
+                f"{row['protection_pct']:.1f}%",
+            ]
+            for _, row in sorted_bt.iterrows()
+        ]
+
+        bt_table = ax_bt_table.table(
+            cellText=bt_table_data,
+            colLabels=[
+                "Date",
+                "% Change",
+                "Price",
+                "Unhedged",
+                "Hedged",
+                "Benefit",
+                "Protection",
+            ],
+            cellLoc="center",
+            loc="center",
+            colWidths=[0.16, 0.12, 0.12, 0.16, 0.16, 0.16, 0.12],
+        )
+        bt_table.auto_set_font_size(False)
+        bt_table.set_fontsize(8.5)
+        bt_table.scale(1, 1.5)
+
+        for col in range(7):
+            bt_table[(0, col)].set_facecolor("#404040")
+            bt_table[(0, col)].set_text_props(weight="bold", color="white", fontsize=8)
+            bt_table[(0, col)].set_edgecolor("black")
+            bt_table[(0, col)].set_linewidth(1.2)
+
+        for i in range(1, len(bt_table_data) + 1):
+            for j in range(7):
+                cell = bt_table[(i, j)]
+                cell.set_edgecolor("#cccccc")
+                cell.set_linewidth(0.8)
+                cell.set_text_props(fontsize=8, family="monospace")
+                if i % 2 == 0:
+                    cell.set_facecolor("#f9f9f9")
+                else:
+                    cell.set_facecolor("white")
+
+        fig_bt.suptitle(
+            "Backtest of Hedge Performance on Worst Daily Drawdowns",
+            fontsize=14,
+            fontweight="bold",
+            y=0.98,
+        )
+        plt.tight_layout()
+        pdf.savefig(fig_bt, bbox_inches="tight", facecolor="white")
+        plt.close(fig_bt)
+
+    # Page 6: Downside Scenario Analysis
     fig_scenario = plt.figure(figsize=(11, 8.5))
     ax_scenario = fig_scenario.add_subplot(111)
     ax_scenario.axis("off")
@@ -1474,34 +1818,16 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     )
     ax_scenario.add_line(line)
 
-    # Calculate multiple scenarios
-    scenarios = [
-        ("10% Decline", 0.90),
-        ("25% Decline", 0.75),
-        ("50% Decline", 0.50),
-        ("75% Decline", 0.25),
-    ]
-
     scenario_table_data = []
-    for scenario_name, price_mult in scenarios:
-        scenario_price = current_price * price_mult
-        unhedged_pl = portfolio_pl_at_price(scenario_price, [])
-        hedged_pl = portfolio_pl_at_price(scenario_price, recommendations)
-        benefit = hedged_pl["total"] - unhedged_pl["total"]
-        protection = (
-            (benefit / abs(unhedged_pl["total"])) * 100
-            if unhedged_pl["total"] < 0
-            else 0
-        )
-
+    for scenario in scenario_results:
         scenario_table_data.append(
             [
-                scenario_name,
-                f"\\${scenario_price:.2f}",
-                f"\\${unhedged_pl['total']:,.0f}",
-                f"\\${hedged_pl['total']:,.0f}",
-                f"\\${benefit:,.0f}",
-                f"{protection:.1f}%",
+                f"{scenario['drop_pct']:.0f}% Decline",
+                f"\\${scenario['scenario_price']:.2f}",
+                f"\\${scenario['unhedged_total']:,.0f}",
+                f"\\${scenario['hedged_total']:,.0f}",
+                f"\\${scenario['benefit']:,.0f}",
+                f"{scenario['protection_pct']:.1f}%",
             ]
         )
 
@@ -1544,7 +1870,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_scenario, bbox_inches="tight", facecolor="white")
     plt.close(fig_scenario)
 
-    # Page 6: Price Chart with Forward Projections
+    # Page 7: Price Chart with Forward Projections
     fig_price = plt.figure(figsize=(11, 8.5))
     ax_price = fig_price.add_subplot(111)
 
@@ -1664,7 +1990,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_price, bbox_inches="tight")
     plt.close(fig_price)
 
-    # Page 4: P/L Comparison
+    # Page 8: P/L Comparison
     fig_pl = plt.figure(figsize=(11, 8.5))
     ax_pl = fig_pl.add_subplot(111)
 
@@ -1684,7 +2010,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pl.plot(
         prices,
         pl_with_hedge,
-        label=f"Hedged",
+        label="Hedged",
         linewidth=2.5,
         color="#06A77D",
         linestyle="-",
@@ -1724,7 +2050,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_pl, bbox_inches="tight")
     plt.close(fig_pl)
 
-    # Page 5: Options Efficiency Analysis
+    # Page 9: Options Efficiency Analysis
     if options_df is not None and not options_df.empty:
         fig_eff = plt.figure(figsize=(11, 8.5))
         ax_eff = fig_eff.add_subplot(111)
@@ -1805,7 +2131,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         pdf.savefig(fig_eff, bbox_inches="tight")
         plt.close(fig_eff)
 
-    # Page 6: Probability Distribution
+    # Page 10: Probability Distribution
     fig_prob = plt.figure(figsize=(11, 8.5))
     ax_prob = fig_prob.add_subplot(111)
 
@@ -1884,7 +2210,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_prob, bbox_inches="tight")
     plt.close(fig_prob)
 
-    # Page 7: Position Summary - Detailed Breakdown
+    # Page 11: Position Summary - Detailed Breakdown
     fig_pos = plt.figure(figsize=(11, 8.5))
     ax_pos = fig_pos.add_subplot(111)
     ax_pos.axis("off")
@@ -1893,7 +2219,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pos.text(
         0.5,
         0.96,
-        f"Hedge Positions: Detailed Analysis",
+        "Hedge Positions: Detailed Analysis",
         fontsize=16,
         fontweight="bold",
         ha="center",
@@ -1924,7 +2250,14 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     table1_data = []  # Position details
     table2_data = []  # Financial metrics
     headers1 = ["Pos", "Strike", "Expiration", "DTE", "Contracts"]
-    headers2 = ["Pos", "Premium", "Cost", "ITM%", "Value@50%", "ROI%"]
+    headers2 = [
+        "Pos",
+        "Premium",
+        "Cost",
+        "ITM%",
+        f"Value@{worst_drop_pct:.0f}%",
+        "ROI%",
+    ]
 
     for i, pos in enumerate(recommendations):
         strike = pos["strike"]
@@ -1934,15 +2267,15 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         exp_date = pos.get("exp_date", today + pd.Timedelta(days=dte))
         cost = premium * 100 * contracts
 
-        intrinsic_50 = max(strike - scenario_price_50_down, 0) * 100 * contracts
-        net_value_50 = intrinsic_50 - cost
+        intrinsic_drop = max(strike - scenario_price_down, 0) * 100 * contracts
+        net_value_drop = intrinsic_drop - cost
         prob_itm = (
             calculate_price_probability(
                 strike, current_price, dte, daily_vol, annual_vol
             )
             * 100
         )
-        protection_ratio = f"{(net_value_50 / cost) * 100:.1f}" if cost > 0 else "N/A"
+        protection_ratio = f"{(net_value_drop / cost) * 100:.1f}" if cost > 0 else "N/A"
 
         table1_data.append(
             [
@@ -1960,7 +2293,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
                 f"\\${premium:.2f}",
                 f"\\${cost:,.0f}",
                 f"{prob_itm:.1f}",
-                f"\\${net_value_50:,.0f}",
+                f"\\${net_value_drop:,.0f}",
                 protection_ratio,
             ]
         )
@@ -1969,9 +2302,9 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     total_cost = sum(
         p.get("premium", 0) * 100 * p.get("contracts", 0) for p in recommendations
     )
-    total_value_50 = (
+    total_value_drop = (
         sum(
-            max(p.get("strike", 0) - scenario_price_50_down, 0)
+            max(p.get("strike", 0) - scenario_price_down, 0)
             * 100
             * p.get("contracts", 0)
             for p in recommendations
@@ -1979,7 +2312,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         - total_cost
     )
     total_ratio = (
-        f"{(total_value_50 / total_cost) * 100:.1f}" if total_cost > 0 else "N/A"
+        f"{(total_value_drop / total_cost) * 100:.1f}" if total_cost > 0 else "N/A"
     )
     total_contracts = sum(p.get("contracts", 0) for p in recommendations)
 
@@ -1991,7 +2324,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
             "-",
             f"\\${total_cost:,.0f}",
             "-",
-            f"\\${total_value_50:,.0f}",
+            f"\\${total_value_drop:,.0f}",
             total_ratio,
         ]
     )
@@ -2158,7 +2491,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     ax_pos.text(
         col2_x,
         summary_y,
-        "Hedge Benefit (50% drop):",
+        f"Hedge Benefit ({worst_drop_pct:.0f}% drop):",
         fontsize=9,
         ha="left",
         transform=fig_pos.transFigure,
