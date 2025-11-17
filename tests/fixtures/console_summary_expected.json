@@ -1,0 +1,4 @@
+{
+  "projection_days": 30,
+  "summary": "Ticker: EOSE\nCurrent price: $3.21\nExpected 30-day range: $2.10 - $4.80\nAnnualized volatility (hist): 74.20%\nRecommended hedge ladder:\n  30d put @ $2.50 × 1 | premium $0.35 | cost $35\n  60d put @ $2.00 × 2 | premium $0.22 | cost $44\nHedge benefit (50% drop): $5,800 (64.4% protection)"
+}
