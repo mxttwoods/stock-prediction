@@ -1625,7 +1625,117 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_risk, bbox_inches="tight", facecolor="white")
     plt.close(fig_risk)
 
-    # Page 5: Downside Scenario Analysis
+    # Page 5: Historical Drawdown Backtest
+    if not backtest_df.empty:
+        fig_bt, (ax_bt_chart, ax_bt_table) = plt.subplots(
+            1, 2, figsize=(11, 8.5), gridspec_kw={"width_ratios": [1.3, 1]}
+        )
+
+        # Chart: Hedge benefit across worst drawdowns
+        sorted_bt = backtest_df.sort_values("date")
+        x = np.arange(len(sorted_bt))
+        width = 0.35
+
+        ax_bt_chart.bar(
+            x - width / 2,
+            sorted_bt["unhedged_total"],
+            width,
+            color="#D62828",
+            alpha=0.7,
+            label="Unhedged P/L",
+        )
+        ax_bt_chart.bar(
+            x + width / 2,
+            sorted_bt["hedged_total"],
+            width,
+            color="#06A77D",
+            alpha=0.75,
+            label="Hedged P/L",
+        )
+        for idx, benefit in enumerate(sorted_bt["benefit"]):
+            ax_bt_chart.text(
+                idx,
+                max(sorted_bt["hedged_total"].iloc[idx], sorted_bt["unhedged_total"].iloc[idx])
+                + 0.02 * abs(sorted_bt[["hedged_total", "unhedged_total"]]).values.max(),
+                f"$ {benefit:,.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=45,
+                color="#333333",
+            )
+
+        ax_bt_chart.set_title(
+            "Historical Drawdown Backtest", fontsize=12, fontweight="bold"
+        )
+        ax_bt_chart.set_ylabel("Net P/L ($)", fontsize=10)
+        ax_bt_chart.set_xticks(x)
+        ax_bt_chart.set_xticklabels(sorted_bt["date"], rotation=45, ha="right")
+        ax_bt_chart.legend(fontsize=8)
+        ax_bt_chart.grid(True, alpha=0.3, linestyle=":")
+
+        # Table: Detailed backtest metrics
+        ax_bt_table.axis("off")
+        bt_table_data = [
+            [
+                row["date"],
+                f"{row['pct_change']:.2f}%",
+                f"\\${row['price']:.2f}",
+                f"\\${row['unhedged_total']:,.0f}",
+                f"\\${row['hedged_total']:,.0f}",
+                f"\\${row['benefit']:,.0f}",
+                f"{row['protection_pct']:.1f}%",
+            ]
+            for _, row in sorted_bt.iterrows()
+        ]
+
+        bt_table = ax_bt_table.table(
+            cellText=bt_table_data,
+            colLabels=[
+                "Date",
+                "% Change",
+                "Price",
+                "Unhedged",
+                "Hedged",
+                "Benefit",
+                "Protection",
+            ],
+            cellLoc="center",
+            loc="center",
+            colWidths=[0.16, 0.12, 0.12, 0.16, 0.16, 0.16, 0.12],
+        )
+        bt_table.auto_set_font_size(False)
+        bt_table.set_fontsize(8.5)
+        bt_table.scale(1, 1.5)
+
+        for col in range(7):
+            bt_table[(0, col)].set_facecolor("#404040")
+            bt_table[(0, col)].set_text_props(weight="bold", color="white", fontsize=8)
+            bt_table[(0, col)].set_edgecolor("black")
+            bt_table[(0, col)].set_linewidth(1.2)
+
+        for i in range(1, len(bt_table_data) + 1):
+            for j in range(7):
+                cell = bt_table[(i, j)]
+                cell.set_edgecolor("#cccccc")
+                cell.set_linewidth(0.8)
+                cell.set_text_props(fontsize=8, family="monospace")
+                if i % 2 == 0:
+                    cell.set_facecolor("#f9f9f9")
+                else:
+                    cell.set_facecolor("white")
+
+        fig_bt.suptitle(
+            "Backtest of Hedge Performance on Worst Daily Drawdowns",
+            fontsize=14,
+            fontweight="bold",
+            y=0.98,
+        )
+        plt.tight_layout()
+        pdf.savefig(fig_bt, bbox_inches="tight", facecolor="white")
+        plt.close(fig_bt)
+
+    # Page 6: Downside Scenario Analysis
     fig_scenario = plt.figure(figsize=(11, 8.5))
     ax_scenario = fig_scenario.add_subplot(111)
     ax_scenario.axis("off")
@@ -1713,7 +1823,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_scenario, bbox_inches="tight", facecolor="white")
     plt.close(fig_scenario)
 
-    # Page 6: Price Chart with Forward Projections
+    # Page 7: Price Chart with Forward Projections
     fig_price = plt.figure(figsize=(11, 8.5))
     ax_price = fig_price.add_subplot(111)
 
@@ -1833,7 +1943,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_price, bbox_inches="tight")
     plt.close(fig_price)
 
-    # Page 4: P/L Comparison
+    # Page 8: P/L Comparison
     fig_pl = plt.figure(figsize=(11, 8.5))
     ax_pl = fig_pl.add_subplot(111)
 
@@ -1893,7 +2003,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_pl, bbox_inches="tight")
     plt.close(fig_pl)
 
-    # Page 5: Options Efficiency Analysis
+    # Page 9: Options Efficiency Analysis
     if options_df is not None and not options_df.empty:
         fig_eff = plt.figure(figsize=(11, 8.5))
         ax_eff = fig_eff.add_subplot(111)
@@ -1974,7 +2084,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
         pdf.savefig(fig_eff, bbox_inches="tight")
         plt.close(fig_eff)
 
-    # Page 6: Probability Distribution
+    # Page 10: Probability Distribution
     fig_prob = plt.figure(figsize=(11, 8.5))
     ax_prob = fig_prob.add_subplot(111)
 
@@ -2053,7 +2163,7 @@ Portfolio Coverage: {(total_contracts * 100 / SHARES_HELD) * 100:.0f}%
     pdf.savefig(fig_prob, bbox_inches="tight")
     plt.close(fig_prob)
 
-    # Page 7: Position Summary - Detailed Breakdown
+    # Page 11: Position Summary - Detailed Breakdown
     fig_pos = plt.figure(figsize=(11, 8.5))
     ax_pos = fig_pos.add_subplot(111)
     ax_pos.axis("off")
