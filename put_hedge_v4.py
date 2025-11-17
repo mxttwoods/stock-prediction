@@ -287,18 +287,21 @@ def project_bollinger_bands_forward(current_price, sma, std, days_ahead, daily_v
     projected_bb_dn = []
 
     current_sma_val = sma.iloc[-1] if not pd.isna(sma.iloc[-1]) else current_price
-    current_std_val = (
-        std.iloc[-1] if not pd.isna(std.iloc[-1]) else daily_vol * current_price
-    )
+    base_std = std.iloc[-1] if not pd.isna(std.iloc[-1]) else daily_vol * current_price
 
     for i in range(days_ahead):
+        # Project SMA with trend
         current_sma_val += recent_trend
-        time_factor = 1 + (i / days_ahead) * 0.1
-        current_std_val = current_std_val * time_factor
+        current_sma_val = max(current_sma_val, current_price * 0.01)
+
+        # Volatility scales with square root of time
+        # We scale from the BB_WINDOW baseline to (BB_WINDOW + i + 1) days
+        time_scaling = np.sqrt((BB_WINDOW + i + 1) / BB_WINDOW)
+        projected_std = base_std * time_scaling
 
         projected_sma.append(current_sma_val)
-        projected_bb_up.append(current_sma_val + BB_STD * current_std_val)
-        projected_bb_dn.append(current_sma_val - BB_STD * current_std_val)
+        projected_bb_up.append(max(current_sma_val + BB_STD * projected_std, 0))
+        projected_bb_dn.append(max(current_sma_val - BB_STD * projected_std, 0))
 
     return (
         future_dates,
@@ -317,8 +320,9 @@ future_dates, proj_sma, proj_bb_up, proj_bb_dn = project_bollinger_bands_forward
 )
 
 # Expected move window (projected BB range)
-expected_low = proj_bb_dn[-1]
-expected_high = proj_bb_up[-1]
+# we need to clamp expected to zero if it is less than zero
+expected_low = max(proj_bb_dn[-1], 0)
+expected_high = max(proj_bb_up[-1], 0)
 
 # =================== PROBABILITY CALCULATIONS ===================
 
