@@ -24,7 +24,7 @@ def parse_cli_args():
         "--config", type=Path, help="Path to JSON config file", default=None
     )
     parser.add_argument(
-        "--ticker", type=str, default="ONDS", help="Ticker symbol to analyze"
+        "--ticker", type=str, default="EOSE", help="Ticker symbol to analyze"
     )
     parser.add_argument("--shares", type=int, default=400, help="Number of shares held")
     parser.add_argument(
