@@ -26,9 +26,9 @@ def parse_cli_args():
     parser.add_argument(
         "--ticker", type=str, default="EOSE", help="Ticker symbol to analyze"
     )
-    parser.add_argument("--shares", type=int, default=400, help="Number of shares held")
+    parser.add_argument("--shares", type=int, default=500, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=75, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -59,6 +59,12 @@ def parse_cli_args():
         type=int,
         default=30,
         help="Number of business days for forward projection",
+    )
+    parser.add_argument(
+        "--trend-lookback",
+        type=int,
+        default=20,
+        help="Lookback window in days for calculating recent trend",
     )
     parser.add_argument(
         "--min-volume", type=int, default=5, help="Minimum option volume filter"
@@ -112,6 +118,8 @@ BB_STD = float(file_config.get("bb_std", cli_args.bb_std))
 FORWARD_PROJECTION_DAYS = int(
     file_config.get("forward_projection_days", cli_args.forward_days)
 )
+
+TREND_LOOKBACK_WINDOW = int(file_config.get("trend_lookback", cli_args.trend_lookback))
 
 # Liquidity filters
 MIN_VOLUME = int(file_config.get("min_volume", cli_args.min_volume))
@@ -275,33 +283,54 @@ bb_lower = current_sma - BB_STD * current_std
 
 
 def project_bollinger_bands_forward(current_price, sma, std, days_ahead, daily_vol):
-    """Project Bollinger Bands forward using current values and volatility."""
-    recent_trend = (close.iloc[-1] - close.iloc[-20]) / 20 if len(close) >= 20 else 0
+    """
+    Project Bollinger Bands forward using Expected Move methodology:
+    - Uses absolute dollar standard deviation (like original BB)
+    - Scales std by √(time) for expected move
+    - Center can drift with trend, starting from current SMA
+    """
     last_date = df.index[-1]
     future_dates = pd.date_range(
         start=last_date + pd.Timedelta(days=1), periods=days_ahead, freq="B"
     )
 
+    # Get current SMA and std (in absolute dollars, not percentages)
+    current_sma_val = sma.iloc[-1] if not pd.isna(sma.iloc[-1]) else current_price
+    base_std = std.iloc[-1] if not pd.isna(std.iloc[-1]) else daily_vol * current_price
+
+    # Calculate trend for SMA drift
+    lookback_size = min(TREND_LOOKBACK_WINDOW, len(close))
+    if lookback_size >= 2:
+        recent_prices = close.iloc[-lookback_size:].values
+        x = np.arange(len(recent_prices))
+        coeffs = np.polyfit(x, recent_prices, 1)
+        daily_trend = coeffs[0]  # Daily dollar change
+    else:
+        daily_trend = 0
+
     projected_sma = []
     projected_bb_up = []
     projected_bb_dn = []
 
-    current_sma_val = sma.iloc[-1] if not pd.isna(sma.iloc[-1]) else current_price
-    base_std = std.iloc[-1] if not pd.isna(std.iloc[-1]) else daily_vol * current_price
-
     for i in range(days_ahead):
-        # Project SMA with trend
-        current_sma_val += recent_trend
+        # Project SMA with trend (incremental, like v3)
+        # Add trend each day to the previous day's SMA value
+        current_sma_val += daily_trend
         current_sma_val = max(current_sma_val, current_price * 0.01)
 
         # Volatility scales with square root of time
-        # We scale from the BB_WINDOW baseline to (BB_WINDOW + i + 1) days
+        # Scale from BB_WINDOW baseline to (BB_WINDOW + i + 1) days
+        # This matches v3 exactly
         time_scaling = np.sqrt((BB_WINDOW + i + 1) / BB_WINDOW)
         projected_std = base_std * time_scaling
 
+        # Bollinger Bands: SMA ± BB_STD × projected_std
+        projected_bb_up_val = current_sma_val + BB_STD * projected_std
+        projected_bb_dn_val = current_sma_val - BB_STD * projected_std
+
         projected_sma.append(current_sma_val)
-        projected_bb_up.append(max(current_sma_val + BB_STD * projected_std, 0))
-        projected_bb_dn.append(max(current_sma_val - BB_STD * projected_std, 0))
+        projected_bb_up.append(max(projected_bb_up_val, 0))
+        projected_bb_dn.append(max(projected_bb_dn_val, 0))
 
     return (
         future_dates,
