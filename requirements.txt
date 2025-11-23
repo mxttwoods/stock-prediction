@@ -3,3 +3,10 @@ pandas
 numpy
 matplotlib
 scipy
+xgboost
+scikit-learn
+seaborn
+nbformat
+nbconvert
+ipykernel
+fastparquet
