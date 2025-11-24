@@ -49,11 +49,11 @@ def parse_cli_args():
         "--config", type=Path, help="Path to JSON config file", default=None
     )
     parser.add_argument(
-        "--ticker", type=str, default="EOSE", help="Ticker symbol to analyze"
+        "--ticker", type=str, default="APLD", help="Ticker symbol to analyze"
     )
     parser.add_argument("--shares", type=int, default=600, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=50, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -92,10 +92,10 @@ def parse_cli_args():
         help="Lookback window in days for calculating recent trend",
     )
     parser.add_argument(
-        "--min-volume", type=int, default=5, help="Minimum option volume filter"
+        "--min-volume", type=int, default=10, help="Minimum option volume filter (increase for large-cap stocks)"
     )
     parser.add_argument(
-        "--min-oi", type=int, default=25, help="Minimum open interest filter"
+        "--min-oi", type=int, default=50, help="Minimum open interest filter (increase for large-cap stocks)"
     )
     parser.add_argument(
         "--max-spread",
@@ -292,6 +292,12 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
                         (puts["bid"] > 0) & (puts["ask"] > 0)
                     ) | (puts["lastPrice"] > 0)
                     puts = puts[valid_pricing]
+
+                    # IMPROVEMENT: Filter out options with zero or near-zero bids (illiquid)
+                    # Options with $0.00 bid cannot be sold back
+                    min_bid_threshold = 0.05  # Minimum $0.05 bid to ensure exit liquidity
+                    valid_bid = puts["bid"] >= min_bid_threshold
+                    puts = puts[valid_bid]
 
                     if not puts.empty:
                         all_puts.append(puts)
@@ -647,6 +653,14 @@ def analyze_put_option(
     # Distance from current price
     distance_pct = ((strike - current_price) / current_price) * 100
 
+    # IMPROVEMENT: Calculate liquidity score (0-100)
+    # Multi-factor score to identify truly liquid options
+    volume_score = min(int(put_row["volume"]) / 500.0, 1.0) * 25  # Max at 500 volume
+    oi_score = min(int(put_row["openInterest"]) / 1000.0, 1.0) * 25  # Max at 1000 OI
+    spread_score = max(1.0 - spread_ratio, 0) * 25  # Lower spread = higher score
+    bid_score = min(bid / premium, 1.0) * 25 if premium > 0 else 0  # Bid proximity to premium
+    liquidity_score = volume_score + oi_score + spread_score + bid_score
+
     return {
         "strike": strike,
         "premium": premium,
@@ -669,6 +683,7 @@ def analyze_put_option(
         "spread": spread,
         "spread_ratio": spread_ratio,
         "implied_vol": float(put_row.get("impliedVolatility", np.nan)),
+        "liquidity_score": liquidity_score,  # NEW: Liquidity metric
     }
 
 
@@ -713,9 +728,32 @@ def recommend_optimal_hedge(
 
     analyzed_df = pd.DataFrame(analyzed_puts)
 
+    # IMPROVEMENT: DTE-based liquidity requirements
+    # Near-expiry options become illiquid fast, require higher thresholds
+    def get_liquidity_requirements(dte):
+        """Get minimum volume/OI based on days to expiration."""
+        if dte <= 7:
+            return MIN_VOLUME * 2, int(MIN_OPEN_INTEREST * 1.5)  # 2x volume, 1.5x OI for weeklies
+        elif dte <= 14:
+            return int(MIN_VOLUME * 1.5), int(MIN_OPEN_INTEREST * 1.25)  # 1.5x volume, 1.25x OI
+        else:
+            return MIN_VOLUME, MIN_OPEN_INTEREST
+
+    # Apply DTE-adjusted liquidity filter
+    analyzed_df["min_volume_required"] = analyzed_df["dte"].apply(
+        lambda dte: get_liquidity_requirements(dte)[0]
+    )
+    analyzed_df["min_oi_required"] = analyzed_df["dte"].apply(
+        lambda dte: get_liquidity_requirements(dte)[1]
+    )
+    analyzed_df["meets_liquidity"] = (
+        (analyzed_df["volume"] >= analyzed_df["min_volume_required"])
+        & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
+    )
+
     # Filter criteria:
     # 1. Strikes below lower bound (likely to provide protection)
-    # 2. Reasonable liquidity (volume or open interest)
+    # 2. Reasonable liquidity (DTE-adjusted volume and open interest)
     # 3. Within budget constraints
 
     # Focus on strikes that would be in-the-money if price drops to lower bound
@@ -724,8 +762,7 @@ def recommend_optimal_hedge(
         & (analyzed_df["strike"] <= current_price * 0.95)  # Below current price
         & (analyzed_df["premium"] > 0)
         & (analyzed_df["efficiency_score"] > 0)
-        & (analyzed_df["volume"] >= MIN_VOLUME)
-        & (analyzed_df["open_interest"] >= MIN_OPEN_INTEREST)
+        & (analyzed_df["meets_liquidity"])  # IMPROVEMENT: DTE-adjusted liquidity
         & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
     ].copy()
 
@@ -734,8 +771,7 @@ def recommend_optimal_hedge(
         protective_puts = analyzed_df[
             (analyzed_df["strike"] <= current_price)
             & (analyzed_df["premium"] > 0)
-            & (analyzed_df["volume"] >= MIN_VOLUME)
-            & (analyzed_df["open_interest"] >= MIN_OPEN_INTEREST)
+            & (analyzed_df["meets_liquidity"])  # IMPROVEMENT: DTE-adjusted liquidity
             & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
         ].copy()
 
@@ -781,6 +817,7 @@ def recommend_optimal_hedge(
                         "efficiency_score": best_put["efficiency_score"],
                         "prob_itm": best_put["prob_itm"],
                         "protection_per_dollar": best_put["protection_per_dollar"],
+                        "liquidity_score": best_put["liquidity_score"],  # NEW: Include liquidity
                     }
                 )
 
@@ -854,11 +891,32 @@ def recommend_full_protection_hedge(
 
     analyzed_df = pd.DataFrame(analyzed_puts)
 
+    # IMPROVEMENT: DTE-based liquidity requirements (same as recommend_optimal_hedge)
+    def get_liquidity_requirements(dte):
+        """Get minimum volume/OI based on days to expiration."""
+        if dte <= 7:
+            return MIN_VOLUME * 2, int(MIN_OPEN_INTEREST * 1.5)
+        elif dte <= 14:
+            return int(MIN_VOLUME * 1.5), int(MIN_OPEN_INTEREST * 1.25)
+        else:
+            return MIN_VOLUME, MIN_OPEN_INTEREST
+
+    # Apply DTE-adjusted liquidity filter
+    analyzed_df["min_volume_required"] = analyzed_df["dte"].apply(
+        lambda dte: get_liquidity_requirements(dte)[0]
+    )
+    analyzed_df["min_oi_required"] = analyzed_df["dte"].apply(
+        lambda dte: get_liquidity_requirements(dte)[1]
+    )
+    analyzed_df["meets_liquidity"] = (
+        (analyzed_df["volume"] >= analyzed_df["min_volume_required"])
+        & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
+    )
+
     # Filter for liquid, tradeable options
     valid_puts = analyzed_df[
         (analyzed_df["premium"] > 0)
-        & (analyzed_df["volume"] >= MIN_VOLUME)
-        & (analyzed_df["open_interest"] >= MIN_OPEN_INTEREST)
+        & (analyzed_df["meets_liquidity"])  # IMPROVEMENT: DTE-adjusted liquidity
         & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
     ].copy()
 
@@ -951,7 +1009,8 @@ def recommend_full_protection_hedge(
             "prob_itm": put_option["prob_itm"],
             "protection_per_dollar": put_option["protection_per_dollar"],
             "protection_at_target": position_protection,
-            "phase": "Coverage",
+            "liquidity_score": put_option["liquidity_score"],  # NEW: Include liquidity
+            "phase": "Coverage (Short-term)",
         })
 
         total_cost += position_cost
@@ -1020,7 +1079,8 @@ def recommend_full_protection_hedge(
                     "prob_itm": put_option["prob_itm"],
                     "protection_per_dollar": put_option["protection_per_dollar"],
                     "protection_at_target": position_protection,
-                    "phase": f"Rollability-{label}",
+                    "liquidity_score": put_option["liquidity_score"],  # NEW: Include liquidity
+                    "phase": f"Extension ({label})",
                 })
 
                 total_cost += position_cost
@@ -1144,6 +1204,15 @@ if recommendations:
         print(f"     Cost: ${rec['cost']:.0f} | ITM Prob: {rec['prob_itm']*100:.1f}% | Eff: {rec['efficiency_score']:.1f}")
 else:
     print("\n⚠️  No eligible put options found for the configured filters.")
+    print("\n🔍 Possible reasons:")
+    print("   • All options have $0.00 bids (illiquid market)")
+    print("   • Volume/OI below minimum thresholds")
+    print("   • Bid-ask spreads too wide")
+    print("\n💡 Suggestions:")
+    print("   • Try longer expirations (--max-dte 60 or --max-dte 90)")
+    print("   • Lower liquidity filters: --min-volume 1 --min-oi 10")
+    print("   • Wait for better market liquidity")
+    print("   • Consider this may be telling you the hedge isn't available right now")
 
 print("="*60 + "\n")
 
@@ -1694,7 +1763,7 @@ with PdfPages(pdf_filename) as pdf:
                    fontsize=14, ha="right", va="center", color="white", zorder=2)
 
         # Table Headers
-        headers = ["Strike", "DTE", "Contracts", "Cost", "ITM Prob", "Efficiency", "Phase"]
+        headers = ["Strike", "DTE", "Contracts", "Cost", "ITM Prob", "Efficiency", "Liquidity", "Phase"]
         # Distribute columns evenly within table width
         col_width = table_width / len(headers)
         col_positions = [table_left + (i * col_width) + (col_width/2) for i in range(len(headers))]
@@ -1725,10 +1794,14 @@ with PdfPages(pdf_filename) as pdf:
             prob = pos.get("prob_itm", 0)
             if prob < 1.0: prob *= 100
             eff = pos.get("efficiency_score", 0)
+            liquidity = pos.get("liquidity_score", 0)  # NEW: Get liquidity score
             phase = pos.get("phase", "N/A")
 
             # Color coding for Phase
             phase_color = "#06A77D" if "Coverage" in str(phase) else "#2E86AB"
+
+            # Color coding for liquidity (red if poor, green if good)
+            liquidity_color = "#D62828" if liquidity < 40 else "#06A77D" if liquidity >= 60 else "black"
 
             # Row data
             row_data = [
@@ -1738,6 +1811,7 @@ with PdfPages(pdf_filename) as pdf:
                 (f"${cost:,.0f}", "black", "normal"),
                 (f"{prob:.1f}%", "black", "normal"),
                 (f"{eff:.1f}", "#D62828" if eff < 20 else "black", "bold" if eff > 50 else "normal"),
+                (f"{liquidity:.0f}", liquidity_color, "bold" if liquidity < 40 else "normal"),  # NEW: Show liquidity
                 (f"{phase}", phase_color, "bold")
             ]
 
