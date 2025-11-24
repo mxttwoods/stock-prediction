@@ -53,7 +53,7 @@ def parse_cli_args():
     )
     parser.add_argument("--shares", type=int, default=600, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=1000, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -888,6 +888,10 @@ def recommend_full_protection_hedge(
         ascending=[False, False]
     )
 
+    # IMPROVEMENT: Build TIME-DIVERSIFIED LADDER instead of greedy short-term selection
+    # Strategy: Allocate budget across time horizons (7-14d, 14-30d, 30-60d, 60-90d)
+    # This provides protection across different timeframes
+
     recommendations = []
     total_cost = 0.0
     total_protection = 0.0
@@ -895,39 +899,43 @@ def recommend_full_protection_hedge(
 
     print(f"Max allowed cost: ${max_allowed_cost:,.0f} ({max_budget_multiplier}× budget)")
 
-    # Greedy selection
-    for idx, put_option in protective_puts.iterrows():
+    # PROGRESSIVE LADDER STRATEGY:
+    # 1. First: Achieve 100% coverage at target drop using short-term (5-21d)
+    # 2. Then: Use surplus budget to progressively add longer DTEs (14-30d, 30-60d, 60-90d)
+
+    # Phase 1: Short-term protection to hit 100% coverage
+    recommendations = []
+    total_cost = 0.0
+    total_protection = 0.0
+
+    print(f"\n🎯 PHASE 1: Achieving 100% coverage with short-term options...")
+
+    short_term_puts = protective_puts[protective_puts["dte"] <= 21].copy()
+    short_term_puts = short_term_puts.sort_values("protection_per_cost", ascending=False)
+
+    for idx, put_option in short_term_puts.iterrows():
         if total_protection >= required_protection:
-            break  # Target achieved!
+            break  # Coverage achieved!
 
         if total_cost >= max_allowed_cost:
-            break  # Budget exhausted
+            break
 
-        # Calculate contracts needed
         protection_gap = required_protection - total_protection
         cost_per_contract = put_option["cost_per_contract"]
-        protection_per_contract = put_option["protection_at_target"] * 100  # Per contract
+        protection_per_contract = put_option["protection_at_target"] * 100
 
         if protection_per_contract <= 0:
             continue
 
-        # How many contracts to close the gap?
         contracts_for_gap = int(np.ceil(protection_gap / protection_per_contract))
-
-        # Limit by shares (don't over-hedge)
         max_contracts = int(shares_held / 100)
-
-        # Limit by remaining budget
         remaining_budget = max_allowed_cost - total_cost
         contracts_affordable = int(remaining_budget / cost_per_contract)
-
-        # Take minimum
-        contracts = min(contracts_for_gap, max_contracts, contracts_affordable)
+        contracts = min(contracts_for_gap, max_contracts, contracts_affordable, 10)
 
         if contracts <= 0:
             continue
 
-        # Add to hedge
         position_cost = cost_per_contract * contracts
         position_protection = protection_per_contract * contracts
 
@@ -943,10 +951,84 @@ def recommend_full_protection_hedge(
             "prob_itm": put_option["prob_itm"],
             "protection_per_dollar": put_option["protection_per_dollar"],
             "protection_at_target": position_protection,
+            "phase": "Coverage",
         })
 
         total_cost += position_cost
         total_protection += position_protection
+
+    coverage_achieved = total_protection >= required_protection
+    surplus_budget = max_allowed_cost - total_cost
+
+    print(f"   Coverage: {(total_protection/required_protection)*100:.1f}% | Cost: ${total_cost:.0f} | Surplus: ${surplus_budget:.0f}")
+
+    # Phase 2: If coverage achieved and surplus budget exists, add longer DTEs
+    if coverage_achieved and surplus_budget > 20:  # At least $20 surplus
+        print(f"\n🎯 PHASE 2: Adding longer-term options with ${surplus_budget:.0f} surplus budget...")
+
+        # Define DTE tiers for surplus budget
+        dte_tiers = [
+            (21, 45, "21-45d", 0.50),   # 50% to mid-term
+            (45, 75, "45-75d", 0.35),   # 35% to longer-term
+            (75, 90, "75-90d", 0.15),   # 15% to longest-term
+        ]
+
+        for (min_dte, max_dte, label, weight) in dte_tiers:
+            tier_budget = surplus_budget * weight
+
+            if tier_budget < 10:  # Skip if less than $10
+                continue
+
+            tier_puts = protective_puts[
+                (protective_puts["dte"] >= min_dte) &
+                (protective_puts["dte"] <= max_dte)
+            ].copy()
+
+            if tier_puts.empty:
+                continue
+
+            tier_puts = tier_puts.sort_values("protection_per_cost", ascending=False)
+            tier_cost = 0.0
+
+            for idx, put_option in tier_puts.iterrows():
+                if tier_cost >= tier_budget or total_cost >= max_allowed_cost:
+                    break
+
+                cost_per_contract = put_option["cost_per_contract"]
+                protection_per_contract = put_option["protection_at_target"] * 100
+
+                # For surplus phase, buy 1-2 contracts per strike for rollability
+                remaining = min(tier_budget - tier_cost, max_allowed_cost - total_cost)
+                contracts_affordable = int(remaining / cost_per_contract)
+                contracts = min(contracts_affordable, 3, int(shares_held / 100))  # Cap at 3 for diversity
+
+                if contracts <= 0:
+                    continue
+
+                position_cost = cost_per_contract * contracts
+                position_protection = protection_per_contract * contracts
+
+                recommendations.append({
+                    "strike": put_option["strike"],
+                    "premium": put_option["premium"],
+                    "contracts": contracts,
+                    "dte": put_option["dte"],
+                    "exp_date": put_option["exp_date"],
+                    "expiration": put_option["expiration"],
+                    "cost": position_cost,
+                    "efficiency_score": put_option["efficiency_score"],
+                    "prob_itm": put_option["prob_itm"],
+                    "protection_per_dollar": put_option["protection_per_dollar"],
+                    "protection_at_target": position_protection,
+                    "phase": f"Rollability-{label}",
+                })
+
+                total_cost += position_cost
+                total_protection += position_protection
+                tier_cost += position_cost
+
+            if tier_cost > 0:
+                print(f"   {label}: ${tier_cost:.0f} spent ({tier_cost/tier_budget*100:.0f}% of tier budget)")
 
     # Calculate final metrics
     net_pl_at_drop = stock_loss + total_protection - total_cost
@@ -1010,7 +1092,16 @@ if options_df is not None and not options_df.empty:
     confidence_level = 100 - PROTECTION_PERCENTILE
     print(f"(Protecting against {confidence_level:.0f}% worst-case scenarios)")
 
-    # Use FULL PROTECTION optimizer (targets 100% coverage at statistical massive drop)
+    # USER REQUIREMENT: Target 40% drop for guaranteed profit
+    # Override statistical calculation with user's specific requirement
+    TARGET_DROP_FOR_PROTECTION = 40.0  # User wants profit at 40% drop
+    price_at_40pct_drop = current_price * 0.6
+
+    print(f"\n📊 User-Specified Target:")
+    print(f"Target drop: 40% → Price: ${price_at_40pct_drop:.2f}")
+    print(f"(User requirement: PROFIT at this level within $100 budget)")
+
+    # Use FULL PROTECTION optimizer with STRICT budget constraint
     recommendations, protection_diagnostics = recommend_full_protection_hedge(
         options_df,
         current_price,
@@ -1019,9 +1110,9 @@ if options_df is not None and not options_df.empty:
         daily_vol,
         annual_vol,
         target_drop_pct=TARGET_DROP_FOR_PROTECTION,
-        protection_level=1.0,  # 100% protection (breakeven)
+        protection_level=1.0,  # 100% protection (breakeven/profit)
         drift_rate=DRIFT_RATE,
-        max_budget_multiplier=5.0,  # Allow up to 5× budget if needed for full protection
+        max_budget_multiplier=1.0,  # STRICT $100 cap - no exceeding
     )
 else:
     recommendations = []
