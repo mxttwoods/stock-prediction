@@ -53,7 +53,7 @@ def parse_cli_args():
     )
     parser.add_argument("--shares", type=int, default=600, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=1000, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=100, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -1588,69 +1588,56 @@ ax4.set_ylabel("Probability Below Price (%)", fontsize=10)
 ax4.legend(loc="best", fontsize=8)
 ax4.grid(True, alpha=0.3)
 
-# ===== PLOT 5: Position Summary =====
+# ===== PLOT 5: Hedge Strategy Summary (First Page) =====
 ax5 = fig.add_subplot(gs[3, :])
 ax5.axis("off")
 
-y_pos = 0.7
-bar_height = 0.12
-spacing = 0.22
+# High-level summary metrics
+if protection_diagnostics:
+    target_drop = protection_diagnostics.get('target_drop_pct', TARGET_DROP_FOR_PROTECTION)
+    summary_metrics = [
+        f"Total Hedge Cost: ${protection_diagnostics.get('total_cost', 0):,.0f}",
+        f"Protection at {target_drop:.0f}% Drop: ${protection_diagnostics.get('total_protection', 0):,.0f}",
+        f"Net P/L at {target_drop:.0f}% Drop: ${protection_diagnostics.get('net_pl_at_drop', 0):,.0f}",
+        f"Protection Level: {protection_diagnostics.get('protection_pct', 0):.1f}%",
+        f"Budget Utilization: {(protection_diagnostics.get('total_cost', 0)/INSURANCE_BUDGET)*100:.1f}%",
+    ]
+else:
+    summary_metrics = ["No recommendations generated."]
 
-for i, pos in enumerate(recommendations):
-    strike = pos["strike"]
-    premium = pos.get("premium", 0)
-    contracts = pos.get("contracts", 0)
-    dte = pos.get("dte", 0)
-    exp_date = pos.get("exp_date", today + pd.Timedelta(days=dte))
-    cost = premium * 100 * contracts
-
-    intrinsic_worst = max(strike - scenario_price_down, 0) * 100 * contracts
-    net_value_worst = intrinsic_worst - cost
-    prob_itm = (
-        calculate_downside_probability(
-            strike, current_price, dte, daily_vol, annual_vol, DRIFT_RATE
-        )
-        * 100
-    )
-
-    x_start = 0.05
-    x_width = 0.9
-    y_start = y_pos - bar_height / 2
-    color = "#90EE90" if strike > scenario_price_down else "#FFB6C1"
-
-    rect = Rectangle(
-        (x_start, y_start),
-        x_width,
-        bar_height,
-        facecolor=color,
-        edgecolor="black",
-        linewidth=1.5,
-        alpha=0.6,
-    )
-    ax5.add_patch(rect)
-
-    strike_text = f"{dte}d Put @ ${strike:.1f} × {contracts} contracts | Exp: {exp_date.strftime('%Y-%m-%d')}"
-    ax5.text(0.1, y_pos, strike_text, fontsize=9, fontweight="bold", va="center")
-    cost_text = (
-        f"Cost: USD {cost:,.0f} | At {worst_drop_pct:.0f}% drop: USD {net_value_worst:,.0f} | "
-        f"ITM Prob: {prob_itm:.1f}%"
-    )
-    ax5.text(0.1, y_pos - 0.06, cost_text, fontsize=8, va="center")
-
-    y_pos -= spacing
-
-summary_text = f"Positions | Total Cost: USD {scenario_hedged['premium_paid']:,.0f} | "
-summary_text += f"Hedge Benefit at {worst_drop_pct:.0f}% Drop: USD {hedge_benefit:,.0f} | Annual Vol: {annual_vol * 100:.1f}%"
+# Draw summary box
 ax5.text(
     0.5,
-    0.95,
-    "PUT POSITIONS",
+    0.85,
+    "HEDGE STRATEGY SUMMARY",
     fontsize=14,
     fontweight="bold",
     ha="center",
     transform=ax5.transAxes,
 )
-ax5.text(0.5, 0.88, summary_text, fontsize=10, ha="center", transform=ax5.transAxes)
+
+# Display metrics in a clean row
+metrics_text = "   |   ".join(summary_metrics)
+ax5.text(
+    0.5,
+    0.65,
+    metrics_text,
+    fontsize=10,
+    ha="center",
+    transform=ax5.transAxes,
+    bbox=dict(boxstyle="round,pad=0.5", facecolor="#f0f0f0", alpha=0.5),
+)
+
+# Add note about detailed positions
+ax5.text(
+    0.5,
+    0.4,
+    f"See subsequent pages for detailed breakdown of {len(recommendations)} recommended positions.",
+    fontsize=10,
+    style="italic",
+    ha="center",
+    transform=ax5.transAxes,
+)
 
 ax5.set_xlim(0, 1)
 ax5.set_ylim(0, 1)
@@ -1676,6 +1663,98 @@ with PdfPages(pdf_filename) as pdf:
     # Save the main dashboard
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+    # =================== PAGE 1.5: DETAILED POSITIONS ===================
+    print("📊 Generating detailed positions pages...")
+
+    # Split recommendations into chunks for pagination
+    items_per_page = 15  # Increased slightly as we have more space with better margins
+    rec_chunks = [recommendations[i:i + items_per_page] for i in range(0, len(recommendations), items_per_page)]
+
+    for page_num, chunk in enumerate(rec_chunks):
+        # Use consistent page size with Page 1 (20x16)
+        fig_pos = plt.figure(figsize=(20, 16))
+        ax_pos = fig_pos.add_subplot(111)
+        ax_pos.axis("off")
+
+        # Calculate centering coordinates
+        # Table width approx 0.8 of page width
+        # Table height depends on rows, centered vertically
+
+        table_width = 0.8
+        table_left = (1.0 - table_width) / 2
+
+        # Professional Header Bar
+        header_rect = Rectangle((table_left, 0.85), table_width, 0.08, facecolor="#2E86AB", alpha=1.0, zorder=1)
+        ax_pos.add_patch(header_rect)
+
+        ax_pos.text(0.5, 0.89, f"Recommended Hedge Positions",
+                   fontsize=24, fontweight="bold", ha="center", va="center", color="white", zorder=2)
+        ax_pos.text(table_left + table_width - 0.02, 0.89, f"Page {page_num + 1}/{len(rec_chunks)}",
+                   fontsize=14, ha="right", va="center", color="white", zorder=2)
+
+        # Table Headers
+        headers = ["Strike", "DTE", "Contracts", "Cost", "ITM Prob", "Efficiency", "Phase"]
+        # Distribute columns evenly within table width
+        col_width = table_width / len(headers)
+        col_positions = [table_left + (i * col_width) + (col_width/2) for i in range(len(headers))]
+
+        header_y = 0.78
+
+        # Draw header background
+        ax_pos.add_patch(Rectangle((table_left, header_y - 0.025), table_width, 0.05, facecolor="#E0E0E0", alpha=1.0))
+
+        for i, header in enumerate(headers):
+            ax_pos.text(col_positions[i], header_y, header, fontsize=14, fontweight="bold", color="#333333", ha="center")
+
+        # List positions with Zebra Striping
+        y_pos = 0.70
+        row_height = 0.05
+
+        for idx, pos in enumerate(chunk):
+            # Zebra striping
+            if idx % 2 == 0:
+                ax_pos.add_patch(Rectangle((table_left, y_pos - 0.02), table_width, row_height, facecolor="#F8F9FA", alpha=1.0))
+            else:
+                ax_pos.add_patch(Rectangle((table_left, y_pos - 0.02), table_width, row_height, facecolor="#FFFFFF", alpha=1.0))
+
+            strike = pos["strike"]
+            dte = pos.get("dte", 0)
+            contracts = pos.get("contracts", 0)
+            cost = pos.get("cost", 0)
+            prob = pos.get("prob_itm", 0)
+            if prob < 1.0: prob *= 100
+            eff = pos.get("efficiency_score", 0)
+            phase = pos.get("phase", "N/A")
+
+            # Color coding for Phase
+            phase_color = "#06A77D" if "Coverage" in str(phase) else "#2E86AB"
+
+            # Row data
+            row_data = [
+                (f"${strike:.2f}", "black", "normal"),
+                (f"{dte}d", "black", "normal"),
+                (f"{contracts}", "black", "normal"),
+                (f"${cost:,.0f}", "black", "normal"),
+                (f"{prob:.1f}%", "black", "normal"),
+                (f"{eff:.1f}", "#D62828" if eff < 20 else "black", "bold" if eff > 50 else "normal"),
+                (f"{phase}", phase_color, "bold")
+            ]
+
+            for i, (text, color, weight) in enumerate(row_data):
+                ax_pos.text(col_positions[i], y_pos, text, fontsize=12, color=color, fontweight=weight, ha="center")
+
+            y_pos -= row_height
+
+        # Footer
+        ax_pos.text(0.5, 0.05, f"Generated by Put Hedge V5 Analysis - {TICKER} - {today.strftime('%Y-%m-%d')}",
+                   fontsize=10, ha="center", color="#666666")
+
+        # Adjust margins explicitly
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+
+        pdf.savefig(fig_pos, bbox_inches="tight")
+        plt.close(fig_pos)
 
     # =================== PAGE 2: TECHNICAL INDICATORS ===================
 
