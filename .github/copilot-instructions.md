@@ -12,6 +12,7 @@ CLI Args / JSON Config → Data Loading (yfinance + parquet cache) → Technical
 ```
 
 **Key components in execution order:**
+
 1. `parse_cli_args()` + `load_config()` - Configuration with JSON file override
 2. `load_price_history()` - Cached price data in `{ticker}_data_file.parquet`
 3. `fetch_live_options_chain()` - Live options with strict liquidity filtering
@@ -22,19 +23,23 @@ CLI Args / JSON Config → Data Loading (yfinance + parquet cache) → Technical
 ## Critical Conventions
 
 ### Probability Calculations
+
 - Uses log-normal GBM model with **configurable drift** (`DRIFT_RATE`, default 5%)
 - `calculate_downside_probability()` returns P(S_T ≤ K), not P(S_T ≥ K)
 - Time scaling: σ_t = σ × √t (from current date, not BB window)
 
 ### Liquidity Filtering (DTE-adaptive)
+
 ```python
 # Near-expiry requires HIGHER thresholds (see get_liquidity_requirements())
 if dte <= 7:  return MIN_VOLUME * 2, MIN_OPEN_INTEREST * 1.5
 if dte <= 14: return MIN_VOLUME * 1.5, MIN_OPEN_INTEREST * 1.25
 ```
+
 Options must also have `bid >= $0.05` (exit liquidity) and `spread_ratio <= MAX_SPREAD_RATIO`.
 
 ### Two Hedge Strategies
+
 - **`recommend_optimal_hedge()`**: Maximize efficiency score within budget
 - **`recommend_full_protection_hedge()`**: Achieve target coverage, then ladder longer DTEs
 
@@ -55,6 +60,7 @@ python put_hedge_v5_improved.py --config hedge_config.json
 ```
 
 ## Output Files
+
 - `{ticker}_put_hedge_analysis.pdf` - Multi-page visual report
 - `{ticker}_data_file.parquet` - Cached price history (auto-updated)
 - `put_hedge_analysis_review.md` - Methodology documentation
@@ -62,6 +68,7 @@ python put_hedge_v5_improved.py --config hedge_config.json
 ## Adding New Analysis Features
 
 When extending analysis functions, follow this pattern from `analyze_put_option()`:
+
 1. Return `None` for invalid/illiquid options (caller filters these)
 2. Include `liquidity_score` (0-100 composite metric)
 3. Add `exit_strategy` dict via `generate_exit_strategy()`

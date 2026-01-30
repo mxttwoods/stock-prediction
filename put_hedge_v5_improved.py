@@ -1115,7 +1115,9 @@ def recommend_full_protection_hedge(
         n_premium = len(analyzed_df[analyzed_df["premium"] > 0])
         n_liquidity = len(analyzed_df[analyzed_df["meets_liquidity"]])
         n_spread = len(analyzed_df[analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO])
-        print(f"  🔍 Filter summary: {n_total} analyzed → {n_premium} have premium, {n_liquidity} meet liquidity, {n_spread} pass spread (≤{MAX_SPREAD_RATIO}) → {len(valid_puts)} valid")
+        print(
+            f"  🔍 Filter summary: {n_total} analyzed → {n_premium} have premium, {n_liquidity} meet liquidity, {n_spread} pass spread (≤{MAX_SPREAD_RATIO}) → {len(valid_puts)} valid"
+        )
 
     if valid_puts.empty:
         return [], {"error": "No liquid options available"}
@@ -1125,7 +1127,9 @@ def recommend_full_protection_hedge(
     protective_puts = valid_puts[valid_puts["strike"] >= scenario_price * 0.95].copy()
 
     if DEBUG_OPTIONS:
-        print(f"  🔍 Strike filter: need ≥ ${scenario_price * 0.95:.2f} → {len(protective_puts)} of {len(valid_puts)} qualify")
+        print(
+            f"  🔍 Strike filter: need ≥ ${scenario_price * 0.95:.2f} → {len(protective_puts)} of {len(valid_puts)} qualify"
+        )
         if len(valid_puts) > 0 and len(protective_puts) == 0:
             print(f"      Available strikes: {sorted(valid_puts['strike'].tolist())}")
 
@@ -1172,7 +1176,9 @@ def recommend_full_protection_hedge(
 
     # FALLBACK: If no short-term options available, use ALL available options
     if short_term_puts.empty:
-        print("   ⚠️ No short-term options (DTE ≤ 21) available, using all liquid options...")
+        print(
+            "   ⚠️ No short-term options (DTE ≤ 21) available, using all liquid options..."
+        )
         short_term_puts = protective_puts.copy()
 
     short_term_puts = short_term_puts.sort_values(
