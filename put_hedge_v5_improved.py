@@ -38,13 +38,15 @@ from matplotlib.patches import FancyBboxPatch, Rectangle
 from scipy import stats
 from scipy.stats import norm
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # =================== CONFIGURATION ===================
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Hedge analysis tool (V5 - Statistically Improved)")
+    parser = argparse.ArgumentParser(
+        description="Hedge analysis tool (V5 - Statistically Improved)"
+    )
     parser.add_argument(
         "--config", type=Path, help="Path to JSON config file", default=None
     )
@@ -53,7 +55,7 @@ def parse_cli_args():
     )
     parser.add_argument("--shares", type=int, default=100, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=1000, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=5000, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -92,10 +94,16 @@ def parse_cli_args():
         help="Lookback window in days for calculating recent trend",
     )
     parser.add_argument(
-        "--min-volume", type=int, default=10, help="Minimum option volume filter (increase for large-cap stocks)"
+        "--min-volume",
+        type=int,
+        default=10,
+        help="Minimum option volume filter (increase for large-cap stocks)",
     )
     parser.add_argument(
-        "--min-oi", type=int, default=50, help="Minimum open interest filter (increase for large-cap stocks)"
+        "--min-oi",
+        type=int,
+        default=50,
+        help="Minimum open interest filter (increase for large-cap stocks)",
     )
     parser.add_argument(
         "--max-spread",
@@ -143,6 +151,17 @@ def parse_cli_args():
         type=float,
         default=0.65,
         help="Commission per option contract in USD (default: $0.65)",
+    )
+    parser.add_argument(
+        "--min-bid",
+        type=float,
+        default=0.05,
+        help="Minimum bid price for exit liquidity (default: $0.05, use 0.01 for illiquid stocks)",
+    )
+    parser.add_argument(
+        "--debug-options",
+        action="store_true",
+        help="Show diagnostic info about why options are being filtered out",
     )
     return parser.parse_args()
 
@@ -198,8 +217,12 @@ USE_EWMA = file_config.get("use_ewma", cli_args.use_ewma)
 EWMA_SPAN = int(file_config.get("ewma_span", cli_args.ewma_span))
 USE_IMPLIED_VOL = file_config.get("use_iv", cli_args.use_iv)
 IV_WEIGHT = float(file_config.get("iv_weight", cli_args.iv_weight))
-PROTECTION_PERCENTILE = float(file_config.get("protection_percentile", cli_args.protection_percentile))
+PROTECTION_PERCENTILE = float(
+    file_config.get("protection_percentile", cli_args.protection_percentile)
+)
 COMMISSION_PER_CONTRACT = float(file_config.get("commission", cli_args.commission))
+MIN_BID_THRESHOLD = float(file_config.get("min_bid", cli_args.min_bid))
+DEBUG_OPTIONS = file_config.get("debug_options", cli_args.debug_options)
 
 # =================== DATA LOADING ===================
 
@@ -295,16 +318,27 @@ def fetch_live_options_chain(ticker: str, max_dte: int = 30) -> Optional[pd.Data
 
                     # IMPROVEMENT: Filter out options with no pricing data
                     # Keep only options with valid bid/ask or lastPrice
-                    valid_pricing = (
-                        (puts["bid"] > 0) & (puts["ask"] > 0)
-                    ) | (puts["lastPrice"] > 0)
+                    valid_pricing = ((puts["bid"] > 0) & (puts["ask"] > 0)) | (
+                        puts["lastPrice"] > 0
+                    )
+                    before_pricing = len(puts)
                     puts = puts[valid_pricing]
 
                     # IMPROVEMENT: Filter out options with zero or near-zero bids (illiquid)
                     # Options with $0.00 bid cannot be sold back
-                    min_bid_threshold = 0.05  # Minimum $0.05 bid to ensure exit liquidity
-                    valid_bid = puts["bid"] >= min_bid_threshold
+                    before_bid = len(puts)
+                    valid_bid = puts["bid"] >= MIN_BID_THRESHOLD
                     puts = puts[valid_bid]
+
+                    if DEBUG_OPTIONS and (
+                        before_pricing > len(puts) or before_bid > len(puts)
+                    ):
+                        filtered_pricing = before_pricing - before_bid
+                        filtered_bid = before_bid - len(puts)
+                        if filtered_pricing > 0 or filtered_bid > 0:
+                            print(
+                                f"  🔍 {exp_date_str}: {before_pricing} raw → {filtered_pricing} no pricing, {filtered_bid} low bid → {len(puts)} remain"
+                            )
 
                     if not puts.empty:
                         all_puts.append(puts)
@@ -358,7 +392,7 @@ def get_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
         ticker_obj = yf.Ticker(ticker)
         calendar = ticker_obj.calendar
         if calendar is not None and not calendar.empty:
-            earnings_date = calendar.get('Earnings Date')
+            earnings_date = calendar.get("Earnings Date")
             if earnings_date is not None:
                 # Returns a list/range, take first date
                 if isinstance(earnings_date, (list, tuple)) and len(earnings_date) > 0:
@@ -373,7 +407,9 @@ def get_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
 earnings_date = get_earnings_date(TICKER)
 if earnings_date:
     days_to_earnings = (earnings_date - today).days
-    print(f"📅 Next earnings: {earnings_date.strftime('%Y-%m-%d')} ({days_to_earnings} days)")
+    print(
+        f"📅 Next earnings: {earnings_date.strftime('%Y-%m-%d')} ({days_to_earnings} days)"
+    )
 else:
     print(f"📅 Earnings date: Not available")
 
@@ -390,33 +426,41 @@ if USE_EWMA:
     # Exponentially weighted volatility (more weight on recent data)
     ewma_var = returns.ewm(span=EWMA_SPAN, adjust=False).var()
     daily_vol = np.sqrt(ewma_var.iloc[-1])
-    print(f"📊 Using EWMA volatility (span={EWMA_SPAN} days): {daily_vol*100:.2f}% daily")
+    print(
+        f"📊 Using EWMA volatility (span={EWMA_SPAN} days): {daily_vol * 100:.2f}% daily"
+    )
 else:
     # Equal-weighted historical volatility
     daily_vol = returns.std()
-    print(f"📊 Using equal-weighted historical volatility: {daily_vol*100:.2f}% daily")
+    print(
+        f"📊 Using equal-weighted historical volatility: {daily_vol * 100:.2f}% daily"
+    )
 
 annual_vol_hist = daily_vol * np.sqrt(252)
 
 # IMPROVEMENT: Get average implied volatility from options chain
 annual_vol_iv = np.nan
 if options_df is not None and not options_df.empty and USE_IMPLIED_VOL:
-    valid_iv = options_df["impliedVolatility"].replace([np.inf, -np.inf], np.nan).dropna()
+    valid_iv = (
+        options_df["impliedVolatility"].replace([np.inf, -np.inf], np.nan).dropna()
+    )
     if len(valid_iv) > 0:
         # Use ATM implied vol (closest to current price)
         options_df["strike_dist"] = np.abs(options_df["strike"] - current_price)
         atm_options = options_df.nsmallest(10, "strike_dist")
         annual_vol_iv = atm_options["impliedVolatility"].median()
-        print(f"📊 Market implied volatility (IV): {annual_vol_iv*100:.2f}%")
+        print(f"📊 Market implied volatility (IV): {annual_vol_iv * 100:.2f}%")
 
 # IMPROVEMENT: Blend historical and implied volatility
 if not np.isnan(annual_vol_iv) and USE_IMPLIED_VOL:
     annual_vol = IV_WEIGHT * annual_vol_iv + (1 - IV_WEIGHT) * annual_vol_hist
-    print(f"📊 Using blended volatility ({IV_WEIGHT*100:.0f}% IV, {(1-IV_WEIGHT)*100:.0f}% hist): {annual_vol*100:.2f}%")
+    print(
+        f"📊 Using blended volatility ({IV_WEIGHT * 100:.0f}% IV, {(1 - IV_WEIGHT) * 100:.0f}% hist): {annual_vol * 100:.2f}%"
+    )
     daily_vol = annual_vol / np.sqrt(252)
 else:
     annual_vol = annual_vol_hist
-    print(f"📊 Using historical volatility only: {annual_vol*100:.2f}%")
+    print(f"📊 Using historical volatility only: {annual_vol * 100:.2f}%")
 
 # Current BB values
 current_sma = (
@@ -500,7 +544,9 @@ def project_bollinger_bands_forward(current_price, sma, std, days_ahead, daily_v
     )
 
     if is_significant:
-        print(f"📈 Detected significant trend: ${daily_trend:.4f}/day (p={p_value:.4f})")
+        print(
+            f"📈 Detected significant trend: ${daily_trend:.4f}/day (p={p_value:.4f})"
+        )
     else:
         print(f"📊 No significant trend detected (p={p_value:.3f}), using drift only")
         daily_trend = 0.0
@@ -515,7 +561,7 @@ def project_bollinger_bands_forward(current_price, sma, std, days_ahead, daily_v
     for i in range(days_ahead):
         # Project center with trend + drift FROM CURRENT PRICE
         days_forward = i + 1
-        projected_center += (daily_trend + daily_drift)
+        projected_center += daily_trend + daily_drift
         projected_center = max(projected_center, current_price * 0.01)
 
         # IMPROVEMENT: Proper time-scaling for volatility
@@ -697,7 +743,9 @@ def analyze_put_option(
     volume_score = min(int(put_row["volume"]) / 500.0, 1.0) * 25  # Max at 500 volume
     oi_score = min(int(put_row["openInterest"]) / 1000.0, 1.0) * 25  # Max at 1000 OI
     spread_score = max(1.0 - spread_ratio, 0) * 25  # Lower spread = higher score
-    bid_score = min(bid / premium, 1.0) * 25 if premium > 0 else 0  # Bid proximity to premium
+    bid_score = (
+        min(bid / premium, 1.0) * 25 if premium > 0 else 0
+    )  # Bid proximity to premium
     liquidity_score = volume_score + oi_score + spread_score + bid_score
 
     return {
@@ -745,9 +793,9 @@ def generate_exit_strategy(
             'warnings': List[str],  # Any special warnings
         }
     """
-    dte = position.get('dte', 30)
-    liquidity_score = position.get('liquidity_score', 50)
-    exp_date = position.get('exp_date')
+    dte = position.get("dte", 30)
+    liquidity_score = position.get("liquidity_score", 50)
+    exp_date = position.get("exp_date")
 
     warnings = []
 
@@ -774,7 +822,7 @@ def generate_exit_strategy(
     # Calculate exit date
     if exp_date and isinstance(exp_date, pd.Timestamp):
         exit_date = exp_date - pd.Timedelta(days=exit_dte)
-        exit_date_str = exit_date.strftime('%m/%d')
+        exit_date_str = exit_date.strftime("%m/%d")
     else:
         exit_date_str = f"{exit_dte}d before expiry"
 
@@ -783,21 +831,27 @@ def generate_exit_strategy(
 
     # Rule 3: Earnings considerations
     if earnings_date and exp_date:
-        if isinstance(exp_date, pd.Timestamp) and isinstance(earnings_date, pd.Timestamp):
+        if isinstance(exp_date, pd.Timestamp) and isinstance(
+            earnings_date, pd.Timestamp
+        ):
             days_to_earnings = (earnings_date - pd.Timestamp.today()).days
 
             # If expiry is after earnings and earnings is soon
             if exp_date > earnings_date and 0 < days_to_earnings < 14:
-                warnings.append(f"⚠️ Earnings in {days_to_earnings}d - IV crush risk after announcement")
+                warnings.append(
+                    f"⚠️ Earnings in {days_to_earnings}d - IV crush risk after announcement"
+                )
                 if days_to_earnings < 7:
-                    warnings.append("Consider exiting BEFORE earnings unless targeting the move")
+                    warnings.append(
+                        "Consider exiting BEFORE earnings unless targeting the move"
+                    )
 
     return {
-        'exit_dte': exit_dte,
-        'exit_date': exit_date_str,
-        'reason': reason,
-        'profit_target': profit_target,
-        'warnings': warnings
+        "exit_dte": exit_dte,
+        "exit_date": exit_date_str,
+        "reason": reason,
+        "profit_target": profit_target,
+        "warnings": warnings,
     }
 
 
@@ -850,9 +904,13 @@ def recommend_optimal_hedge(
     def get_liquidity_requirements(dte):
         """Get minimum volume/OI based on days to expiration."""
         if dte <= 7:
-            return MIN_VOLUME * 2, int(MIN_OPEN_INTEREST * 1.5)  # 2x volume, 1.5x OI for weeklies
+            return MIN_VOLUME * 2, int(
+                MIN_OPEN_INTEREST * 1.5
+            )  # 2x volume, 1.5x OI for weeklies
         elif dte <= 14:
-            return int(MIN_VOLUME * 1.5), int(MIN_OPEN_INTEREST * 1.25)  # 1.5x volume, 1.25x OI
+            return int(MIN_VOLUME * 1.5), int(
+                MIN_OPEN_INTEREST * 1.25
+            )  # 1.5x volume, 1.25x OI
         else:
             return MIN_VOLUME, MIN_OPEN_INTEREST
 
@@ -864,9 +922,8 @@ def recommend_optimal_hedge(
         lambda dte: get_liquidity_requirements(dte)[1]
     )
     analyzed_df["meets_liquidity"] = (
-        (analyzed_df["volume"] >= analyzed_df["min_volume_required"])
-        & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
-    )
+        analyzed_df["volume"] >= analyzed_df["min_volume_required"]
+    ) & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
 
     # Filter criteria:
     # 1. Strikes below lower bound (likely to provide protection)
@@ -928,9 +985,9 @@ def recommend_optimal_hedge(
 
                 # Generate exit strategy
                 temp_position = {
-                    'dte': best_put["dte"],
-                    'liquidity_score': best_put["liquidity_score"],
-                    'exp_date': best_put["exp_date"]
+                    "dte": best_put["dte"],
+                    "liquidity_score": best_put["liquidity_score"],
+                    "exp_date": best_put["exp_date"],
                 }
                 exit_strategy = generate_exit_strategy(temp_position, earnings_date)
 
@@ -1000,7 +1057,9 @@ def recommend_full_protection_hedge(
     print(f"\n🎯 FULL PROTECTION MODE")
     print(f"Target drop: {target_drop_pct}% → Price: ${scenario_price:.2f}")
     print(f"Stock loss at drop: ${stock_loss:,.0f}")
-    print(f"Required protection ({protection_level*100:.0f}%): ${required_protection:,.0f}")
+    print(
+        f"Required protection ({protection_level * 100:.0f}%): ${required_protection:,.0f}"
+    )
 
     # Analyze all options
     analyzed_puts = []
@@ -1041,9 +1100,8 @@ def recommend_full_protection_hedge(
         lambda dte: get_liquidity_requirements(dte)[1]
     )
     analyzed_df["meets_liquidity"] = (
-        (analyzed_df["volume"] >= analyzed_df["min_volume_required"])
-        & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
-    )
+        analyzed_df["volume"] >= analyzed_df["min_volume_required"]
+    ) & (analyzed_df["open_interest"] >= analyzed_df["min_oi_required"])
 
     # Filter for liquid, tradeable options
     valid_puts = analyzed_df[
@@ -1052,14 +1110,24 @@ def recommend_full_protection_hedge(
         & (analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO)
     ].copy()
 
+    if DEBUG_OPTIONS:
+        n_total = len(analyzed_df)
+        n_premium = len(analyzed_df[analyzed_df["premium"] > 0])
+        n_liquidity = len(analyzed_df[analyzed_df["meets_liquidity"]])
+        n_spread = len(analyzed_df[analyzed_df["spread_ratio"] <= MAX_SPREAD_RATIO])
+        print(f"  🔍 Filter summary: {n_total} analyzed → {n_premium} have premium, {n_liquidity} meet liquidity, {n_spread} pass spread (≤{MAX_SPREAD_RATIO}) → {len(valid_puts)} valid")
+
     if valid_puts.empty:
         return [], {"error": "No liquid options available"}
 
     # Focus on puts that will provide protection at target drop
     # Prioritize strikes near or above the drop price
-    protective_puts = valid_puts[
-        valid_puts["strike"] >= scenario_price * 0.95
-    ].copy()
+    protective_puts = valid_puts[valid_puts["strike"] >= scenario_price * 0.95].copy()
+
+    if DEBUG_OPTIONS:
+        print(f"  🔍 Strike filter: need ≥ ${scenario_price * 0.95:.2f} → {len(protective_puts)} of {len(valid_puts)} qualify")
+        if len(valid_puts) > 0 and len(protective_puts) == 0:
+            print(f"      Available strikes: {sorted(valid_puts['strike'].tolist())}")
 
     if protective_puts.empty:
         # Fallback: use all puts
@@ -1067,15 +1135,13 @@ def recommend_full_protection_hedge(
 
     # GREEDY ALGORITHM: Build hedge to achieve target protection
     # Sort by "bang for buck" at the target drop scenario
-    protective_puts["protection_per_cost"] = (
-        protective_puts["protection_at_target"] /
-        protective_puts["cost_per_contract"].replace(0, np.inf)
-    )
+    protective_puts["protection_per_cost"] = protective_puts[
+        "protection_at_target"
+    ] / protective_puts["cost_per_contract"].replace(0, np.inf)
 
     # Secondary sort: prefer higher strikes (more ITM at drop)
     protective_puts = protective_puts.sort_values(
-        ["protection_per_cost", "strike"],
-        ascending=[False, False]
+        ["protection_per_cost", "strike"], ascending=[False, False]
     )
 
     # IMPROVEMENT: Build TIME-DIVERSIFIED LADDER instead of greedy short-term selection
@@ -1087,7 +1153,9 @@ def recommend_full_protection_hedge(
     total_protection = 0.0
     max_allowed_cost = budget * max_budget_multiplier
 
-    print(f"Max allowed cost: ${max_allowed_cost:,.0f} ({max_budget_multiplier}× budget)")
+    print(
+        f"Max allowed cost: ${max_allowed_cost:,.0f} ({max_budget_multiplier}× budget)"
+    )
 
     # PROGRESSIVE LADDER STRATEGY:
     # 1. First: Achieve 100% coverage at target drop using short-term (5-21d)
@@ -1101,7 +1169,15 @@ def recommend_full_protection_hedge(
     print(f"\n🎯 PHASE 1: Achieving 100% coverage with short-term options...")
 
     short_term_puts = protective_puts[protective_puts["dte"] <= 21].copy()
-    short_term_puts = short_term_puts.sort_values("protection_per_cost", ascending=False)
+
+    # FALLBACK: If no short-term options available, use ALL available options
+    if short_term_puts.empty:
+        print("   ⚠️ No short-term options (DTE ≤ 21) available, using all liquid options...")
+        short_term_puts = protective_puts.copy()
+
+    short_term_puts = short_term_puts.sort_values(
+        "protection_per_cost", ascending=False
+    )
 
     for idx, put_option in short_term_puts.iterrows():
         if total_protection >= required_protection:
@@ -1136,30 +1212,32 @@ def recommend_full_protection_hedge(
 
         # Generate exit strategy
         temp_position = {
-            'dte': put_option["dte"],
-            'liquidity_score': put_option["liquidity_score"],
-            'exp_date': put_option["exp_date"]
+            "dte": put_option["dte"],
+            "liquidity_score": put_option["liquidity_score"],
+            "exp_date": put_option["exp_date"],
         }
         exit_strategy = generate_exit_strategy(temp_position, earnings_date)
 
-        recommendations.append({
-            "strike": put_option["strike"],
-            "premium": put_option["premium"],
-            "contracts": contracts,
-            "dte": put_option["dte"],
-            "exp_date": put_option["exp_date"],
-            "expiration": put_option["expiration"],
-            "cost": position_cost,
-            "commission": commission_cost,
-            "total_cost": total_position_cost,
-            "efficiency_score": put_option["efficiency_score"],
-            "prob_itm": put_option["prob_itm"],
-            "protection_per_dollar": put_option["protection_per_dollar"],
-            "protection_at_target": position_protection,
-            "liquidity_score": put_option["liquidity_score"],
-            "exit_strategy": exit_strategy,
-            "phase": "Coverage (Short-term)"
-        })
+        recommendations.append(
+            {
+                "strike": put_option["strike"],
+                "premium": put_option["premium"],
+                "contracts": contracts,
+                "dte": put_option["dte"],
+                "exp_date": put_option["exp_date"],
+                "expiration": put_option["expiration"],
+                "cost": position_cost,
+                "commission": commission_cost,
+                "total_cost": total_position_cost,
+                "efficiency_score": put_option["efficiency_score"],
+                "prob_itm": put_option["prob_itm"],
+                "protection_per_dollar": put_option["protection_per_dollar"],
+                "protection_at_target": position_protection,
+                "liquidity_score": put_option["liquidity_score"],
+                "exit_strategy": exit_strategy,
+                "phase": "Coverage (Short-term)",
+            }
+        )
 
         total_cost += total_position_cost
         total_protection += position_protection
@@ -1167,28 +1245,32 @@ def recommend_full_protection_hedge(
     coverage_achieved = total_protection >= required_protection
     surplus_budget = max_allowed_cost - total_cost
 
-    print(f"   Coverage: {(total_protection/required_protection)*100:.1f}% | Cost: ${total_cost:.0f} | Surplus: ${surplus_budget:.0f}")
+    print(
+        f"   Coverage: {(total_protection / required_protection) * 100:.1f}% | Cost: ${total_cost:.0f} | Surplus: ${surplus_budget:.0f}"
+    )
 
     # Phase 2: If coverage achieved and surplus budget exists, add longer DTEs
     if coverage_achieved and surplus_budget > 20:  # At least $20 surplus
-        print(f"\n🎯 PHASE 2: Adding longer-term options with ${surplus_budget:.0f} surplus budget...")
+        print(
+            f"\n🎯 PHASE 2: Adding longer-term options with ${surplus_budget:.0f} surplus budget..."
+        )
 
         # Define DTE tiers for surplus budget
         dte_tiers = [
-            (21, 45, "21-45d", 0.50),   # 50% to mid-term
-            (45, 75, "45-75d", 0.35),   # 35% to longer-term
-            (75, 90, "75-90d", 0.15),   # 15% to longest-term
+            (21, 45, "21-45d", 0.50),  # 50% to mid-term
+            (45, 75, "45-75d", 0.35),  # 35% to longer-term
+            (75, 90, "75-90d", 0.15),  # 15% to longest-term
         ]
 
-        for (min_dte, max_dte, label, weight) in dte_tiers:
+        for min_dte, max_dte, label, weight in dte_tiers:
             tier_budget = surplus_budget * weight
 
             if tier_budget < 10:  # Skip if less than $10
                 continue
 
             tier_puts = protective_puts[
-                (protective_puts["dte"] >= min_dte) &
-                (protective_puts["dte"] <= max_dte)
+                (protective_puts["dte"] >= min_dte)
+                & (protective_puts["dte"] <= max_dte)
             ].copy()
 
             if tier_puts.empty:
@@ -1207,7 +1289,9 @@ def recommend_full_protection_hedge(
                 # For surplus phase, buy 1-2 contracts per strike for rollability
                 remaining = min(tier_budget - tier_cost, max_allowed_cost - total_cost)
                 contracts_affordable = int(remaining / cost_per_contract)
-                contracts = min(contracts_affordable, 3, int(shares_held / 100))  # Cap at 3 for diversity
+                contracts = min(
+                    contracts_affordable, 3, int(shares_held / 100)
+                )  # Cap at 3 for diversity
 
                 if contracts <= 0:
                     continue
@@ -1215,32 +1299,40 @@ def recommend_full_protection_hedge(
                 position_cost = cost_per_contract * contracts
                 position_protection = protection_per_contract * contracts
 
-                recommendations.append({
-                    "strike": put_option["strike"],
-                    "premium": put_option["premium"],
-                    "contracts": contracts,
-                    "dte": put_option["dte"],
-                    "exp_date": put_option["exp_date"],
-                    "expiration": put_option["expiration"],
-                    "cost": position_cost,
-                    "efficiency_score": put_option["efficiency_score"],
-                    "prob_itm": put_option["prob_itm"],
-                    "protection_per_dollar": put_option["protection_per_dollar"],
-                    "protection_at_target": position_protection,
-                    "liquidity_score": put_option["liquidity_score"],  # NEW: Include liquidity
-                    "phase": f"Extension ({label})",
-                })
+                recommendations.append(
+                    {
+                        "strike": put_option["strike"],
+                        "premium": put_option["premium"],
+                        "contracts": contracts,
+                        "dte": put_option["dte"],
+                        "exp_date": put_option["exp_date"],
+                        "expiration": put_option["expiration"],
+                        "cost": position_cost,
+                        "efficiency_score": put_option["efficiency_score"],
+                        "prob_itm": put_option["prob_itm"],
+                        "protection_per_dollar": put_option["protection_per_dollar"],
+                        "protection_at_target": position_protection,
+                        "liquidity_score": put_option[
+                            "liquidity_score"
+                        ],  # NEW: Include liquidity
+                        "phase": f"Extension ({label})",
+                    }
+                )
 
                 total_cost += position_cost
                 total_protection += position_protection
                 tier_cost += position_cost
 
             if tier_cost > 0:
-                print(f"   {label}: ${tier_cost:.0f} spent ({tier_cost/tier_budget*100:.0f}% of tier budget)")
+                print(
+                    f"   {label}: ${tier_cost:.0f} spent ({tier_cost / tier_budget * 100:.0f}% of tier budget)"
+                )
 
     # Calculate final metrics
     net_pl_at_drop = stock_loss + total_protection - total_cost
-    protection_pct = (total_protection / abs(stock_loss)) * 100 if stock_loss != 0 else 0
+    protection_pct = (
+        (total_protection / abs(stock_loss)) * 100 if stock_loss != 0 else 0
+    )
 
     diagnostics = {
         "target_drop_pct": target_drop_pct,
@@ -1257,15 +1349,19 @@ def recommend_full_protection_hedge(
     }
 
     print(f"\n📊 HEDGE RESULTS:")
-    print(f"Total cost: ${total_cost:,.0f} ({total_cost/budget:.1f}× budget)")
+    print(f"Total cost: ${total_cost:,.0f} ({total_cost / budget:.1f}× budget)")
     print(f"Total protection: ${total_protection:,.0f}")
     print(f"Net P/L at {target_drop_pct}% drop: ${net_pl_at_drop:,.0f}")
     print(f"Protection level: {protection_pct:.1f}%")
 
     if net_pl_at_drop >= 0:
-        print(f"✅ TARGET ACHIEVED! You'll break even or profit at {target_drop_pct}% drop")
+        print(
+            f"✅ TARGET ACHIEVED! You'll break even or profit at {target_drop_pct}% drop"
+        )
     elif protection_pct >= 80:
-        print(f"⚠️  Close! {protection_pct:.0f}% protected (${abs(net_pl_at_drop):,.0f} loss)")
+        print(
+            f"⚠️  Close! {protection_pct:.0f}% protected (${abs(net_pl_at_drop):,.0f} loss)"
+        )
     else:
         print(f"❌ Target not achieved. Need more budget or adjust filters.")
 
@@ -1280,22 +1376,28 @@ def recommend_full_protection_hedge(
 
 if options_df is not None and not options_df.empty:
     # Get maximum DTE from available options to set time horizon
-    max_dte_available = int(options_df['DTE'].max()) if len(options_df) > 0 else 30
+    max_dte_available = int(options_df["DTE"].max()) if len(options_df) > 0 else 30
     max_dte_available = min(max_dte_available, 90)  # Cap at 90 days for practicality
 
     # Calculate target percentile price (configurable - default 25th percentile)
     # Using log-normal distribution: log(S_T/S_0) ~ N((μ - 0.5σ²)T, σ²T)
     t = max_dte_available / 252.0
     z_target = norm.ppf(PROTECTION_PERCENTILE / 100.0)
-    log_return_target = (DRIFT_RATE - 0.5 * annual_vol**2) * t + z_target * annual_vol * np.sqrt(t)
+    log_return_target = (
+        DRIFT_RATE - 0.5 * annual_vol**2
+    ) * t + z_target * annual_vol * np.sqrt(t)
     price_at_target_percentile = current_price * np.exp(log_return_target)
 
     # Convert to drop percentage
-    TARGET_DROP_FOR_PROTECTION = ((current_price - price_at_target_percentile) / current_price) * 100
+    TARGET_DROP_FOR_PROTECTION = (
+        (current_price - price_at_target_percentile) / current_price
+    ) * 100
 
     print(f"\n📊 Statistical Target Calculation:")
     print(f"Time horizon: {max_dte_available} days")
-    print(f"{PROTECTION_PERCENTILE:.0f}th percentile price: ${price_at_target_percentile:.2f}")
+    print(
+        f"{PROTECTION_PERCENTILE:.0f}th percentile price: ${price_at_target_percentile:.2f}"
+    )
     print(f"Target drop for protection: {TARGET_DROP_FOR_PROTECTION:.1f}%")
     confidence_level = 100 - PROTECTION_PERCENTILE
     print(f"(Protecting against {confidence_level:.0f}% worst-case scenarios)")
@@ -1329,41 +1431,49 @@ else:
 
 # =================== CONSOLE SUMMARY ===================
 
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print(f"🎯 PUT HEDGE ANALYSIS v5 - {TICKER}")
-print("="*60)
+print("=" * 60)
 print(f"Current Price: ${current_price:.2f}")
 print(f"Shares Held: {SHARES_HELD:,}")
 print(f"Hedge Budget: ${INSURANCE_BUDGET:,.2f}")
 print(f"\n📊 Volatility Analysis:")
-print(f"  Historical Vol: {annual_vol_hist*100:.2f}%")
+print(f"  Historical Vol: {annual_vol_hist * 100:.2f}%")
 if not np.isnan(annual_vol_iv):
-    print(f"  Implied Vol (IV): {annual_vol_iv*100:.2f}%")
-print(f"  Using: {annual_vol*100:.2f}% annualized")
+    print(f"  Implied Vol (IV): {annual_vol_iv * 100:.2f}%")
+print(f"  Using: {annual_vol * 100:.2f}% annualized")
 print(f"\n📈 Forward Projection ({FORWARD_PROJECTION_DAYS} days):")
 print(f"  Lower bound (95%): ${lower_bound_95pct:.2f}")
 print(f"  Upper bound (95%): ${upper_bound_95pct:.2f}")
-print(f"  Drift assumption: {DRIFT_RATE*100:.1f}% annually")
+print(f"  Drift assumption: {DRIFT_RATE * 100:.1f}% annually")
 
 if recommendations:
     print(f"\n✅ Recommended Hedge Positions ({len(recommendations)}):")
     for i, rec in enumerate(recommendations, 1):
-        print(f"  {i}. {rec['dte']}d Put @ ${rec['strike']:.2f} × {rec['contracts']} contracts")
+        print(
+            f"  {i}. {rec['dte']}d Put @ ${rec['strike']:.2f} × {rec['contracts']} contracts"
+        )
 
         # Show costs with commission breakdown
-        gross_cost = rec.get('cost', 0)
-        commission = rec.get('commission', 0)
-        total = rec.get('total_cost', gross_cost + commission)
-        print(f"     Cost: ${gross_cost:.0f} + ${commission:.2f} commission = ${total:.2f} total")
-        print(f"     ITM Prob: {rec['prob_itm']*100:.1f}% |  Liquidity: {rec.get('liquidity_score', 0):.0f}/100")
+        gross_cost = rec.get("cost", 0)
+        commission = rec.get("commission", 0)
+        total = rec.get("total_cost", gross_cost + commission)
+        print(
+            f"     Cost: ${gross_cost:.0f} + ${commission:.2f} commission = ${total:.2f} total"
+        )
+        print(
+            f"     ITM Prob: {rec['prob_itm'] * 100:.1f}% |  Liquidity: {rec.get('liquidity_score', 0):.0f}/100"
+        )
 
         # Show exit strategy
-        if 'exit_strategy' in rec:
-            exit_strat = rec['exit_strategy']
+        if "exit_strategy" in rec:
+            exit_strat = rec["exit_strategy"]
             print(f"     📤 Exit Strategy: {exit_strat['reason']}")
-            print(f"        Target exit: {exit_strat['exit_date']} ({exit_strat['exit_dte']} DTE)")
-            if exit_strat.get('warnings'):
-                for warning in exit_strat['warnings']:
+            print(
+                f"        Target exit: {exit_strat['exit_date']} ({exit_strat['exit_dte']} DTE)"
+            )
+            if exit_strat.get("warnings"):
+                for warning in exit_strat["warnings"]:
                     print(f"        {warning}")
 else:
     print("\n⚠️  No eligible put options found for the configured filters.")
@@ -1377,7 +1487,7 @@ else:
     print("   • Wait for better market liquidity")
     print("   • Consider this may be telling you the hedge isn't available right now")
 
-print("="*60 + "\n")
+print("=" * 60 + "\n")
 
 # =================== P/L CALCULATIONS & SCENARIO ANALYSIS ===================
 
@@ -1826,13 +1936,15 @@ ax5.axis("off")
 
 # High-level summary metrics
 if protection_diagnostics:
-    target_drop = protection_diagnostics.get('target_drop_pct', TARGET_DROP_FOR_PROTECTION)
+    target_drop = protection_diagnostics.get(
+        "target_drop_pct", TARGET_DROP_FOR_PROTECTION
+    )
     summary_metrics = [
         f"Total Hedge Cost: ${protection_diagnostics.get('total_cost', 0):,.0f}",
         f"Protection at {target_drop:.0f}% Drop: ${protection_diagnostics.get('total_protection', 0):,.0f}",
         f"Net P/L at {target_drop:.0f}% Drop: ${protection_diagnostics.get('net_pl_at_drop', 0):,.0f}",
         f"Protection Level: {protection_diagnostics.get('protection_pct', 0):.1f}%",
-        f"Budget Utilization: {(protection_diagnostics.get('total_cost', 0)/INSURANCE_BUDGET)*100:.1f}%",
+        f"Budget Utilization: {(protection_diagnostics.get('total_cost', 0) / INSURANCE_BUDGET) * 100:.1f}%",
     ]
 else:
     summary_metrics = ["No recommendations generated."]
@@ -1875,7 +1987,7 @@ ax5.set_xlim(0, 1)
 ax5.set_ylim(0, 1)
 
 plt.suptitle(
-    f"{TICKER} V5 Hedge Analysis: Statistically Improved (Drift={DRIFT_RATE*100:.0f}%, IV Weight={IV_WEIGHT*100:.0f}%)",
+    f"{TICKER} V5 Hedge Analysis: Statistically Improved (Drift={DRIFT_RATE * 100:.0f}%, IV Weight={IV_WEIGHT * 100:.0f}%)",
     fontsize=16,
     fontweight="bold",
     y=0.998,
@@ -1901,7 +2013,10 @@ with PdfPages(pdf_filename) as pdf:
 
     # Split recommendations into chunks for pagination
     items_per_page = 15  # Increased slightly as we have more space with better margins
-    rec_chunks = [recommendations[i:i + items_per_page] for i in range(0, len(recommendations), items_per_page)]
+    rec_chunks = [
+        recommendations[i : i + items_per_page]
+        for i in range(0, len(recommendations), items_per_page)
+    ]
 
     for page_num, chunk in enumerate(rec_chunks):
         # Use consistent page size with Page 1 (20x16)
@@ -1917,27 +2032,78 @@ with PdfPages(pdf_filename) as pdf:
         table_left = (1.0 - table_width) / 2
 
         # Professional Header Bar
-        header_rect = Rectangle((table_left, 0.85), table_width, 0.08, facecolor="#2E86AB", alpha=1.0, zorder=1)
+        header_rect = Rectangle(
+            (table_left, 0.85),
+            table_width,
+            0.08,
+            facecolor="#2E86AB",
+            alpha=1.0,
+            zorder=1,
+        )
         ax_pos.add_patch(header_rect)
 
-        ax_pos.text(0.5, 0.89, f"Recommended Hedge Positions",
-                   fontsize=24, fontweight="bold", ha="center", va="center", color="white", zorder=2)
-        ax_pos.text(table_left + table_width - 0.02, 0.89, f"Page {page_num + 1}/{len(rec_chunks)}",
-                   fontsize=14, ha="right", va="center", color="white", zorder=2)
+        ax_pos.text(
+            0.5,
+            0.89,
+            f"Recommended Hedge Positions",
+            fontsize=24,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            color="white",
+            zorder=2,
+        )
+        ax_pos.text(
+            table_left + table_width - 0.02,
+            0.89,
+            f"Page {page_num + 1}/{len(rec_chunks)}",
+            fontsize=14,
+            ha="right",
+            va="center",
+            color="white",
+            zorder=2,
+        )
 
         # Table Headers
-        headers = ["Strike", "DTE", "Contracts", "Cost", "ITM Prob", "Efficiency", "Liquidity", "Phase"]
+        headers = [
+            "Strike",
+            "DTE",
+            "Contracts",
+            "Cost",
+            "ITM Prob",
+            "Efficiency",
+            "Liquidity",
+            "Phase",
+        ]
         # Distribute columns evenly within table width
         col_width = table_width / len(headers)
-        col_positions = [table_left + (i * col_width) + (col_width/2) for i in range(len(headers))]
+        col_positions = [
+            table_left + (i * col_width) + (col_width / 2) for i in range(len(headers))
+        ]
 
         header_y = 0.78
 
         # Draw header background
-        ax_pos.add_patch(Rectangle((table_left, header_y - 0.025), table_width, 0.05, facecolor="#E0E0E0", alpha=1.0))
+        ax_pos.add_patch(
+            Rectangle(
+                (table_left, header_y - 0.025),
+                table_width,
+                0.05,
+                facecolor="#E0E0E0",
+                alpha=1.0,
+            )
+        )
 
         for i, header in enumerate(headers):
-            ax_pos.text(col_positions[i], header_y, header, fontsize=14, fontweight="bold", color="#333333", ha="center")
+            ax_pos.text(
+                col_positions[i],
+                header_y,
+                header,
+                fontsize=14,
+                fontweight="bold",
+                color="#333333",
+                ha="center",
+            )
 
         # List positions with Zebra Striping
         y_pos = 0.70
@@ -1946,16 +2112,33 @@ with PdfPages(pdf_filename) as pdf:
         for idx, pos in enumerate(chunk):
             # Zebra striping
             if idx % 2 == 0:
-                ax_pos.add_patch(Rectangle((table_left, y_pos - 0.02), table_width, row_height, facecolor="#F8F9FA", alpha=1.0))
+                ax_pos.add_patch(
+                    Rectangle(
+                        (table_left, y_pos - 0.02),
+                        table_width,
+                        row_height,
+                        facecolor="#F8F9FA",
+                        alpha=1.0,
+                    )
+                )
             else:
-                ax_pos.add_patch(Rectangle((table_left, y_pos - 0.02), table_width, row_height, facecolor="#FFFFFF", alpha=1.0))
+                ax_pos.add_patch(
+                    Rectangle(
+                        (table_left, y_pos - 0.02),
+                        table_width,
+                        row_height,
+                        facecolor="#FFFFFF",
+                        alpha=1.0,
+                    )
+                )
 
             strike = pos["strike"]
             dte = pos.get("dte", 0)
             contracts = pos.get("contracts", 0)
             cost = pos.get("cost", 0)
             prob = pos.get("prob_itm", 0)
-            if prob < 1.0: prob *= 100
+            if prob < 1.0:
+                prob *= 100
             eff = pos.get("efficiency_score", 0)
             liquidity = pos.get("liquidity_score", 0)  # NEW: Get liquidity score
             phase = pos.get("phase", "N/A")
@@ -1964,7 +2147,13 @@ with PdfPages(pdf_filename) as pdf:
             phase_color = "#06A77D" if "Coverage" in str(phase) else "#2E86AB"
 
             # Color coding for liquidity (red if poor, green if good)
-            liquidity_color = "#D62828" if liquidity < 40 else "#06A77D" if liquidity >= 60 else "black"
+            liquidity_color = (
+                "#D62828"
+                if liquidity < 40
+                else "#06A77D"
+                if liquidity >= 60
+                else "black"
+            )
 
             # Row data
             row_data = [
@@ -1973,19 +2162,41 @@ with PdfPages(pdf_filename) as pdf:
                 (f"{contracts}", "black", "normal"),
                 (f"${cost:,.0f}", "black", "normal"),
                 (f"{prob:.1f}%", "black", "normal"),
-                (f"{eff:.1f}", "#D62828" if eff < 20 else "black", "bold" if eff > 50 else "normal"),
-                (f"{liquidity:.0f}", liquidity_color, "bold" if liquidity < 40 else "normal"),  # NEW: Show liquidity
-                (f"{phase}", phase_color, "bold")
+                (
+                    f"{eff:.1f}",
+                    "#D62828" if eff < 20 else "black",
+                    "bold" if eff > 50 else "normal",
+                ),
+                (
+                    f"{liquidity:.0f}",
+                    liquidity_color,
+                    "bold" if liquidity < 40 else "normal",
+                ),  # NEW: Show liquidity
+                (f"{phase}", phase_color, "bold"),
             ]
 
             for i, (text, color, weight) in enumerate(row_data):
-                ax_pos.text(col_positions[i], y_pos, text, fontsize=12, color=color, fontweight=weight, ha="center")
+                ax_pos.text(
+                    col_positions[i],
+                    y_pos,
+                    text,
+                    fontsize=12,
+                    color=color,
+                    fontweight=weight,
+                    ha="center",
+                )
 
             y_pos -= row_height
 
         # Footer
-        ax_pos.text(0.5, 0.05, f"Generated by Put Hedge V5 Analysis - {TICKER} - {today.strftime('%Y-%m-%d')}",
-                   fontsize=10, ha="center", color="#666666")
+        ax_pos.text(
+            0.5,
+            0.05,
+            f"Generated by Put Hedge V5 Analysis - {TICKER} - {today.strftime('%Y-%m-%d')}",
+            fontsize=10,
+            ha="center",
+            color="#666666",
+        )
 
         # Adjust margins explicitly
         plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
@@ -2051,11 +2262,32 @@ with PdfPages(pdf_filename) as pdf:
     rolling_vol_30 = returns.rolling(30).std() * np.sqrt(252) * 100
     rolling_vol_60 = returns.rolling(60).std() * np.sqrt(252) * 100
     # Use returns.index to match the data length
-    ax_vol.plot(returns.index, rolling_vol_30, linewidth=2, color="#D62828", label="30-day Vol", alpha=0.8)
-    ax_vol.plot(returns.index, rolling_vol_60, linewidth=2, color="#2E86AB", label="60-day Vol", alpha=0.8)
-    ax_vol.axhline(annual_vol * 100, color="green", linestyle="--", alpha=0.7,
-                   label=f"Current: {annual_vol*100:.1f}%")
-    ax_vol.fill_between(returns.index, rolling_vol_30, rolling_vol_60, alpha=0.1, color="gray")
+    ax_vol.plot(
+        returns.index,
+        rolling_vol_30,
+        linewidth=2,
+        color="#D62828",
+        label="30-day Vol",
+        alpha=0.8,
+    )
+    ax_vol.plot(
+        returns.index,
+        rolling_vol_60,
+        linewidth=2,
+        color="#2E86AB",
+        label="60-day Vol",
+        alpha=0.8,
+    )
+    ax_vol.axhline(
+        annual_vol * 100,
+        color="green",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Current: {annual_vol * 100:.1f}%",
+    )
+    ax_vol.fill_between(
+        returns.index, rolling_vol_30, rolling_vol_60, alpha=0.1, color="gray"
+    )
     ax_vol.set_title("Rolling Annualized Volatility", fontsize=12, fontweight="bold")
     ax_vol.set_ylabel("Volatility (%)", fontsize=10)
     ax_vol.legend(loc="best", fontsize=8)
@@ -2066,17 +2298,21 @@ with PdfPages(pdf_filename) as pdf:
     if isinstance(df.columns, pd.MultiIndex):
         volume = df.xs("Volume", axis=1, level=0).iloc[:, 0]
     else:
-        volume = df["Volume"] if "Volume" in df.columns else pd.Series(0, index=df.index)
+        volume = (
+            df["Volume"] if "Volume" in df.columns else pd.Series(0, index=df.index)
+        )
 
     volume_ma = volume.rolling(20).mean()
-    colors = ['green' if close.iloc[i] >= close.iloc[i-1] else 'red'
-              for i in range(len(close))]
+    colors = [
+        "green" if close.iloc[i] >= close.iloc[i - 1] else "red"
+        for i in range(len(close))
+    ]
     ax_volume.bar(df.index, volume, color=colors, alpha=0.5, width=0.8)
     ax_volume.plot(df.index, volume_ma, linewidth=2, color="blue", label="20-day MA")
     ax_volume.set_title("Volume Analysis", fontsize=12, fontweight="bold")
     ax_volume.set_ylabel("Volume", fontsize=10)
     ax_volume.legend(loc="best", fontsize=8)
-    ax_volume.grid(True, alpha=0.3, axis='y')
+    ax_volume.grid(True, alpha=0.3, axis="y")
 
     # Plot 5: Drawdown Chart
     ax_dd = fig_tech.add_subplot(gs_tech[2, :])
@@ -2084,12 +2320,19 @@ with PdfPages(pdf_filename) as pdf:
     running_max = cumulative.expanding().max()
     drawdown = (cumulative - running_max) / running_max * 100
     # Use cumulative.index to match the data
-    ax_dd.fill_between(cumulative.index, drawdown, 0, alpha=0.3, color="red", label="Drawdown")
+    ax_dd.fill_between(
+        cumulative.index, drawdown, 0, alpha=0.3, color="red", label="Drawdown"
+    )
     ax_dd.plot(cumulative.index, drawdown, linewidth=1.5, color="darkred")
     max_dd = drawdown.min()
     max_dd_date = drawdown.idxmin()
-    ax_dd.axhline(max_dd, color="red", linestyle="--", alpha=0.7,
-                  label=f"Max DD: {max_dd:.1f}% on {max_dd_date.strftime('%Y-%m-%d')}")
+    ax_dd.axhline(
+        max_dd,
+        color="red",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Max DD: {max_dd:.1f}% on {max_dd_date.strftime('%Y-%m-%d')}",
+    )
     ax_dd.set_title("Historical Drawdown Analysis", fontsize=12, fontweight="bold")
     ax_dd.set_ylabel("Drawdown (%)", fontsize=10)
     ax_dd.set_xlabel("Date", fontsize=10)
@@ -2099,15 +2342,22 @@ with PdfPages(pdf_filename) as pdf:
     # Plot 6: Price Returns Distribution
     ax_dist = fig_tech.add_subplot(gs_tech[3, 0])
     returns_pct = returns * 100
-    ax_dist.hist(returns_pct.dropna(), bins=50, alpha=0.7, color="#2E86AB", edgecolor="black")
-    ax_dist.axvline(returns_pct.mean(), color="red", linestyle="--", linewidth=2,
-                    label=f"Mean: {returns_pct.mean():.2f}%")
+    ax_dist.hist(
+        returns_pct.dropna(), bins=50, alpha=0.7, color="#2E86AB", edgecolor="black"
+    )
+    ax_dist.axvline(
+        returns_pct.mean(),
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Mean: {returns_pct.mean():.2f}%",
+    )
     ax_dist.axvline(0, color="black", linestyle="-", linewidth=1, alpha=0.5)
     ax_dist.set_title("Daily Returns Distribution", fontsize=12, fontweight="bold")
     ax_dist.set_xlabel("Daily Return (%)", fontsize=10)
     ax_dist.set_ylabel("Frequency", fontsize=10)
     ax_dist.legend(loc="best", fontsize=8)
-    ax_dist.grid(True, alpha=0.3, axis='y')
+    ax_dist.grid(True, alpha=0.3, axis="y")
 
     # Plot 7: ATR (Average True Range)
     ax_atr = fig_tech.add_subplot(gs_tech[3, 1])
@@ -2133,8 +2383,12 @@ with PdfPages(pdf_filename) as pdf:
     ax_atr.legend(loc="best", fontsize=8)
     ax_atr.grid(True, alpha=0.3)
 
-    fig_tech.suptitle(f"{TICKER} - Technical Indicators Dashboard",
-                      fontsize=16, fontweight="bold", y=0.995)
+    fig_tech.suptitle(
+        f"{TICKER} - Technical Indicators Dashboard",
+        fontsize=16,
+        fontweight="bold",
+        y=0.995,
+    )
     plt.tight_layout()
     pdf.savefig(fig_tech, bbox_inches="tight")
     plt.close(fig_tech)
@@ -2148,110 +2402,149 @@ with PdfPages(pdf_filename) as pdf:
         gs_greeks = fig_greeks.add_gridspec(3, 2, hspace=0.4, wspace=0.3)
 
         # Calculate approximate Greeks for each recommendation
-        def black_scholes_greeks(S, K, T, r, sigma, option_type='put'):
+        def black_scholes_greeks(S, K, T, r, sigma, option_type="put"):
             """Approximate Black-Scholes Greeks"""
             from scipy.stats import norm
 
             if T <= 0:
-                return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
+                return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
 
             d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
             d2 = d1 - sigma * np.sqrt(T)
 
-            if option_type == 'put':
+            if option_type == "put":
                 delta = norm.cdf(d1) - 1
-                theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
-                        - r * K * np.exp(-r * T) * norm.cdf(-d2))
+                theta = -S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) - r * K * np.exp(
+                    -r * T
+                ) * norm.cdf(-d2)
             else:
                 delta = norm.cdf(d1)
-                theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T))
-                        + r * K * np.exp(-r * T) * norm.cdf(d2))
+                theta = -S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) + r * K * np.exp(
+                    -r * T
+                ) * norm.cdf(d2)
 
             gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
             vega = S * norm.pdf(d1) * np.sqrt(T) / 100  # Per 1% change
 
             return {
-                'delta': delta,
-                'gamma': gamma,
-                'theta': theta / 365,  # Daily theta
-                'vega': vega
+                "delta": delta,
+                "gamma": gamma,
+                "theta": theta / 365,  # Daily theta
+                "vega": vega,
             }
 
         greeks_data = []
         for rec in recommendations:
-            T = rec['dte'] / 365.0
+            T = rec["dte"] / 365.0
             greeks = black_scholes_greeks(
-                current_price, rec['strike'], T,
-                DRIFT_RATE, annual_vol, 'put'
+                current_price, rec["strike"], T, DRIFT_RATE, annual_vol, "put"
             )
-            greeks_data.append({
-                'strike': rec['strike'],
-                'dte': rec['dte'],
-                'contracts': rec['contracts'],
-                'delta': greeks['delta'] * rec['contracts'] * 100,
-                'gamma': greeks['gamma'] * rec['contracts'] * 100,
-                'theta': greeks['theta'] * rec['contracts'] * 100,
-                'vega': greeks['vega'] * rec['contracts'] * 100,
-            })
+            greeks_data.append(
+                {
+                    "strike": rec["strike"],
+                    "dte": rec["dte"],
+                    "contracts": rec["contracts"],
+                    "delta": greeks["delta"] * rec["contracts"] * 100,
+                    "gamma": greeks["gamma"] * rec["contracts"] * 100,
+                    "theta": greeks["theta"] * rec["contracts"] * 100,
+                    "vega": greeks["vega"] * rec["contracts"] * 100,
+                }
+            )
 
         greeks_df = pd.DataFrame(greeks_data)
 
         # Plot 1: Delta by Position
         ax_delta = fig_greeks.add_subplot(gs_greeks[0, 0])
-        strikes = greeks_df['strike'].astype(str)
-        ax_delta.bar(range(len(strikes)), greeks_df['delta'], color='#2E86AB', alpha=0.7)
+        strikes = greeks_df["strike"].astype(str)
+        ax_delta.bar(
+            range(len(strikes)), greeks_df["delta"], color="#2E86AB", alpha=0.7
+        )
         ax_delta.set_xticks(range(len(strikes)))
-        ax_delta.set_xticklabels([f"${s}" for s in greeks_df['strike']], rotation=45)
+        ax_delta.set_xticklabels([f"${s}" for s in greeks_df["strike"]], rotation=45)
         ax_delta.set_title("Portfolio Delta by Strike", fontsize=12, fontweight="bold")
         ax_delta.set_ylabel("Delta (per $1 move)", fontsize=10)
-        ax_delta.axhline(0, color='black', linewidth=0.5)
-        ax_delta.grid(True, alpha=0.3, axis='y')
-        total_delta = greeks_df['delta'].sum()
-        ax_delta.text(0.02, 0.98, f"Total Delta: {total_delta:.1f}",
-                     transform=ax_delta.transAxes, fontsize=10, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax_delta.axhline(0, color="black", linewidth=0.5)
+        ax_delta.grid(True, alpha=0.3, axis="y")
+        total_delta = greeks_df["delta"].sum()
+        ax_delta.text(
+            0.02,
+            0.98,
+            f"Total Delta: {total_delta:.1f}",
+            transform=ax_delta.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
 
         # Plot 2: Theta Decay
         ax_theta = fig_greeks.add_subplot(gs_greeks[0, 1])
-        ax_theta.bar(range(len(strikes)), greeks_df['theta'], color='#D62828', alpha=0.7)
+        ax_theta.bar(
+            range(len(strikes)), greeks_df["theta"], color="#D62828", alpha=0.7
+        )
         ax_theta.set_xticks(range(len(strikes)))
-        ax_theta.set_xticklabels([f"${s}" for s in greeks_df['strike']], rotation=45)
-        ax_theta.set_title("Daily Theta Decay by Strike", fontsize=12, fontweight="bold")
+        ax_theta.set_xticklabels([f"${s}" for s in greeks_df["strike"]], rotation=45)
+        ax_theta.set_title(
+            "Daily Theta Decay by Strike", fontsize=12, fontweight="bold"
+        )
         ax_theta.set_ylabel("Theta (daily decay)", fontsize=10)
-        ax_theta.axhline(0, color='black', linewidth=0.5)
-        ax_theta.grid(True, alpha=0.3, axis='y')
-        total_theta = greeks_df['theta'].sum()
-        ax_theta.text(0.02, 0.98, f"Total Daily Decay: ${total_theta:.2f}",
-                     transform=ax_theta.transAxes, fontsize=10, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax_theta.axhline(0, color="black", linewidth=0.5)
+        ax_theta.grid(True, alpha=0.3, axis="y")
+        total_theta = greeks_df["theta"].sum()
+        ax_theta.text(
+            0.02,
+            0.98,
+            f"Total Daily Decay: ${total_theta:.2f}",
+            transform=ax_theta.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
 
         # Plot 3: Vega Exposure
         ax_vega = fig_greeks.add_subplot(gs_greeks[1, 0])
-        ax_vega.bar(range(len(strikes)), greeks_df['vega'], color='#8B5CF6', alpha=0.7)
+        ax_vega.bar(range(len(strikes)), greeks_df["vega"], color="#8B5CF6", alpha=0.7)
         ax_vega.set_xticks(range(len(strikes)))
-        ax_vega.set_xticklabels([f"${s}" for s in greeks_df['strike']], rotation=45)
-        ax_vega.set_title("Vega (Volatility Sensitivity) by Strike", fontsize=12, fontweight="bold")
+        ax_vega.set_xticklabels([f"${s}" for s in greeks_df["strike"]], rotation=45)
+        ax_vega.set_title(
+            "Vega (Volatility Sensitivity) by Strike", fontsize=12, fontweight="bold"
+        )
         ax_vega.set_ylabel("Vega (per 1% vol change)", fontsize=10)
-        ax_vega.axhline(0, color='black', linewidth=0.5)
-        ax_vega.grid(True, alpha=0.3, axis='y')
-        total_vega = greeks_df['vega'].sum()
-        ax_vega.text(0.02, 0.98, f"Total Vega: {total_vega:.1f}",
-                    transform=ax_vega.transAxes, fontsize=10, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax_vega.axhline(0, color="black", linewidth=0.5)
+        ax_vega.grid(True, alpha=0.3, axis="y")
+        total_vega = greeks_df["vega"].sum()
+        ax_vega.text(
+            0.02,
+            0.98,
+            f"Total Vega: {total_vega:.1f}",
+            transform=ax_vega.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
 
         # Plot 4: Gamma Exposure
         ax_gamma = fig_greeks.add_subplot(gs_greeks[1, 1])
-        ax_gamma.bar(range(len(strikes)), greeks_df['gamma'], color='#06A77D', alpha=0.7)
+        ax_gamma.bar(
+            range(len(strikes)), greeks_df["gamma"], color="#06A77D", alpha=0.7
+        )
         ax_gamma.set_xticks(range(len(strikes)))
-        ax_gamma.set_xticklabels([f"${s}" for s in greeks_df['strike']], rotation=45)
-        ax_gamma.set_title("Gamma (Delta Sensitivity) by Strike", fontsize=12, fontweight="bold")
+        ax_gamma.set_xticklabels([f"${s}" for s in greeks_df["strike"]], rotation=45)
+        ax_gamma.set_title(
+            "Gamma (Delta Sensitivity) by Strike", fontsize=12, fontweight="bold"
+        )
         ax_gamma.set_ylabel("Gamma", fontsize=10)
-        ax_gamma.axhline(0, color='black', linewidth=0.5)
-        ax_gamma.grid(True, alpha=0.3, axis='y')
-        total_gamma = greeks_df['gamma'].sum()
-        ax_gamma.text(0.02, 0.98, f"Total Gamma: {total_gamma:.4f}",
-                     transform=ax_gamma.transAxes, fontsize=10, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax_gamma.axhline(0, color="black", linewidth=0.5)
+        ax_gamma.grid(True, alpha=0.3, axis="y")
+        total_gamma = greeks_df["gamma"].sum()
+        ax_gamma.text(
+            0.02,
+            0.98,
+            f"Total Gamma: {total_gamma:.4f}",
+            transform=ax_gamma.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+        )
 
         # Plot 5: Strike Selection Heatmap (Probability × Protection)
         ax_heatmap = fig_greeks.add_subplot(gs_greeks[2, :])
@@ -2268,36 +2561,55 @@ with PdfPages(pdf_filename) as pdf:
                     prob = calculate_downside_probability(
                         strike, current_price, dte, daily_vol, annual_vol, DRIFT_RATE
                     )
-                    protection = max(strike - current_price * 0.8, 0)  # Protection at 20% drop
+                    protection = max(
+                        strike - current_price * 0.8, 0
+                    )  # Protection at 20% drop
                     score = prob * protection  # Expected protection
                     heatmap_data[i, j] = score
 
-            im = ax_heatmap.imshow(heatmap_data, cmap='RdYlGn', aspect='auto',
-                                   interpolation='bilinear')
+            im = ax_heatmap.imshow(
+                heatmap_data, cmap="RdYlGn", aspect="auto", interpolation="bilinear"
+            )
             ax_heatmap.set_xticks(np.arange(0, len(strikes_range), 2))
-            ax_heatmap.set_xticklabels([f"${s:.1f}" for s in strikes_range[::2]], rotation=45)
+            ax_heatmap.set_xticklabels(
+                [f"${s:.1f}" for s in strikes_range[::2]], rotation=45
+            )
             ax_heatmap.set_yticks(range(len(dte_range)))
             ax_heatmap.set_yticklabels([f"{d}d" for d in dte_range])
-            ax_heatmap.set_title("Strike Selection Heatmap: Expected Protection Value",
-                                fontsize=12, fontweight="bold")
+            ax_heatmap.set_title(
+                "Strike Selection Heatmap: Expected Protection Value",
+                fontsize=12,
+                fontweight="bold",
+            )
             ax_heatmap.set_xlabel("Strike Price", fontsize=10)
             ax_heatmap.set_ylabel("Days to Expiration", fontsize=10)
 
             # Add colorbar
             cbar = fig_greeks.colorbar(im, ax=ax_heatmap)
-            cbar.set_label('Expected Protection Score', rotation=270, labelpad=20)
+            cbar.set_label("Expected Protection Score", rotation=270, labelpad=20)
 
             # Mark recommended positions
             for rec in recommendations:
                 # Find closest strike and dte in the heatmap
-                strike_idx = np.argmin(np.abs(strikes_range - rec['strike']))
-                dte_idx = np.argmin(np.abs(np.array(dte_range) - rec['dte']))
-                ax_heatmap.scatter(strike_idx, dte_idx, s=200, marker='*',
-                                  color='red', edgecolors='black', linewidths=2,
-                                  zorder=10)
+                strike_idx = np.argmin(np.abs(strikes_range - rec["strike"]))
+                dte_idx = np.argmin(np.abs(np.array(dte_range) - rec["dte"]))
+                ax_heatmap.scatter(
+                    strike_idx,
+                    dte_idx,
+                    s=200,
+                    marker="*",
+                    color="red",
+                    edgecolors="black",
+                    linewidths=2,
+                    zorder=10,
+                )
 
-        fig_greeks.suptitle(f"{TICKER} - Options Greeks & Risk Analytics",
-                           fontsize=16, fontweight="bold", y=0.995)
+        fig_greeks.suptitle(
+            f"{TICKER} - Options Greeks & Risk Analytics",
+            fontsize=16,
+            fontweight="bold",
+            y=0.995,
+        )
         plt.tight_layout()
         pdf.savefig(fig_greeks, bbox_inches="tight")
         plt.close(fig_greeks)
@@ -2311,25 +2623,34 @@ with PdfPages(pdf_filename) as pdf:
 
     # Plot 1: Scenario Analysis Table with visualization
     ax_scenarios = fig_scenario.add_subplot(gs_scenario[0, :])
-    ax_scenarios.axis('off')
+    ax_scenarios.axis("off")
 
     scenario_table_data = []
     for scenario in scenario_results:
-        scenario_table_data.append([
-            f"{scenario['drop_pct']:.0f}%",
-            f"${scenario['scenario_price']:.2f}",
-            f"${scenario['unhedged_total']:,.0f}",
-            f"${scenario['hedged_total']:,.0f}",
-            f"${scenario['benefit']:,.0f}",
-            f"{scenario['protection_pct']:.1f}%"
-        ])
+        scenario_table_data.append(
+            [
+                f"{scenario['drop_pct']:.0f}%",
+                f"${scenario['scenario_price']:.2f}",
+                f"${scenario['unhedged_total']:,.0f}",
+                f"${scenario['hedged_total']:,.0f}",
+                f"${scenario['benefit']:,.0f}",
+                f"{scenario['protection_pct']:.1f}%",
+            ]
+        )
 
     table = ax_scenarios.table(
         cellText=scenario_table_data,
-        colLabels=['Drop', 'Price', 'Unhedged P/L', 'Hedged P/L', 'Benefit', 'Protection %'],
-        cellLoc='center',
-        loc='center',
-        bbox=[0.1, 0.3, 0.8, 0.6]
+        colLabels=[
+            "Drop",
+            "Price",
+            "Unhedged P/L",
+            "Hedged P/L",
+            "Benefit",
+            "Protection %",
+        ],
+        cellLoc="center",
+        loc="center",
+        bbox=[0.1, 0.3, 0.8, 0.6],
     )
     table.auto_set_font_size(False)
     table.set_fontsize(10)
@@ -2337,47 +2658,56 @@ with PdfPages(pdf_filename) as pdf:
 
     # Style table
     for i in range(6):
-        table[(0, i)].set_facecolor('#404040')
-        table[(0, i)].set_text_props(weight='bold', color='white', fontsize=11)
+        table[(0, i)].set_facecolor("#404040")
+        table[(0, i)].set_text_props(weight="bold", color="white", fontsize=11)
 
     for i in range(1, len(scenario_table_data) + 1):
         for j in range(6):
             if i % 2 == 0:
-                table[(i, j)].set_facecolor('#f9f9f9')
-            table[(i, j)].set_text_props(fontsize=10, family='monospace')
+                table[(i, j)].set_facecolor("#f9f9f9")
+            table[(i, j)].set_text_props(fontsize=10, family="monospace")
 
-    ax_scenarios.set_title("Comprehensive Scenario Analysis",
-                          fontsize=14, fontweight='bold', pad=20)
+    ax_scenarios.set_title(
+        "Comprehensive Scenario Analysis", fontsize=14, fontweight="bold", pad=20
+    )
 
     # Plot 2: Hedge Effectiveness by Scenario
     ax_eff = fig_scenario.add_subplot(gs_scenario[1, 0])
-    drops = [s['drop_pct'] for s in scenario_results]
-    protections = [s['protection_pct'] for s in scenario_results]
-    ax_eff.bar(range(len(drops)), protections, color='#06A77D', alpha=0.7)
+    drops = [s["drop_pct"] for s in scenario_results]
+    protections = [s["protection_pct"] for s in scenario_results]
+    ax_eff.bar(range(len(drops)), protections, color="#06A77D", alpha=0.7)
     ax_eff.set_xticks(range(len(drops)))
     ax_eff.set_xticklabels([f"{d:.0f}%" for d in drops])
-    ax_eff.set_title("Hedge Effectiveness by Drop Scenario", fontsize=12, fontweight='bold')
+    ax_eff.set_title(
+        "Hedge Effectiveness by Drop Scenario", fontsize=12, fontweight="bold"
+    )
     ax_eff.set_xlabel("Price Drop", fontsize=10)
     ax_eff.set_ylabel("Protection %", fontsize=10)
-    ax_eff.grid(True, alpha=0.3, axis='y')
+    ax_eff.grid(True, alpha=0.3, axis="y")
 
     # Plot 3: Absolute Benefit by Scenario
     ax_benefit = fig_scenario.add_subplot(gs_scenario[1, 1])
-    benefits = [s['benefit'] for s in scenario_results]
-    colors_benefit = ['#06A77D' if b > 0 else '#D62828' for b in benefits]
+    benefits = [s["benefit"] for s in scenario_results]
+    colors_benefit = ["#06A77D" if b > 0 else "#D62828" for b in benefits]
     ax_benefit.bar(range(len(drops)), benefits, color=colors_benefit, alpha=0.7)
     ax_benefit.set_xticks(range(len(drops)))
     ax_benefit.set_xticklabels([f"{d:.0f}%" for d in drops])
-    ax_benefit.set_title("Absolute Hedge Benefit ($) by Scenario", fontsize=12, fontweight='bold')
+    ax_benefit.set_title(
+        "Absolute Hedge Benefit ($) by Scenario", fontsize=12, fontweight="bold"
+    )
     ax_benefit.set_xlabel("Price Drop", fontsize=10)
     ax_benefit.set_ylabel("Hedge Benefit ($)", fontsize=10)
-    ax_benefit.axhline(0, color='black', linewidth=0.5)
-    ax_benefit.grid(True, alpha=0.3, axis='y')
+    ax_benefit.axhline(0, color="black", linewidth=0.5)
+    ax_benefit.grid(True, alpha=0.3, axis="y")
 
-    fig_scenario.suptitle(f"{TICKER} - Detailed Scenario Analysis",
-                         fontsize=16, fontweight='bold', y=0.995)
+    fig_scenario.suptitle(
+        f"{TICKER} - Detailed Scenario Analysis",
+        fontsize=16,
+        fontweight="bold",
+        y=0.995,
+    )
     plt.tight_layout()
-    pdf.savefig(fig_scenario, bbox_inches='tight')
+    pdf.savefig(fig_scenario, bbox_inches="tight")
     plt.close(fig_scenario)
 
     print(f"✅ PDF created successfully: {pdf_filename}")
