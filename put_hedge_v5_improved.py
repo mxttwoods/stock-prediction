@@ -55,7 +55,7 @@ def parse_cli_args():
     )
     parser.add_argument("--shares", type=int, default=100, help="Number of shares held")
     parser.add_argument(
-        "--budget", type=float, default=5000, help="Target budget for hedge (USD)"
+        "--budget", type=float, default=1000, help="Target budget for hedge (USD)"
     )
     parser.add_argument(
         "--max-dte",
@@ -152,17 +152,6 @@ def parse_cli_args():
         default=0.65,
         help="Commission per option contract in USD (default: $0.65)",
     )
-    parser.add_argument(
-        "--min-bid",
-        type=float,
-        default=0.05,
-        help="Minimum bid price for exit liquidity (default: $0.05, use 0.01 for illiquid stocks)",
-    )
-    parser.add_argument(
-        "--debug-options",
-        action="store_true",
-        help="Show diagnostic info about why options are being filtered out",
-    )
     return parser.parse_args()
 
 
@@ -217,12 +206,8 @@ USE_EWMA = file_config.get("use_ewma", cli_args.use_ewma)
 EWMA_SPAN = int(file_config.get("ewma_span", cli_args.ewma_span))
 USE_IMPLIED_VOL = file_config.get("use_iv", cli_args.use_iv)
 IV_WEIGHT = float(file_config.get("iv_weight", cli_args.iv_weight))
-PROTECTION_PERCENTILE = float(
-    file_config.get("protection_percentile", cli_args.protection_percentile)
-)
+PROTECTION_PERCENTILE = float(file_config.get("protection_percentile", cli_args.protection_percentile))
 COMMISSION_PER_CONTRACT = float(file_config.get("commission", cli_args.commission))
-MIN_BID_THRESHOLD = float(file_config.get("min_bid", cli_args.min_bid))
-DEBUG_OPTIONS = file_config.get("debug_options", cli_args.debug_options)
 
 # =================== DATA LOADING ===================
 
@@ -392,7 +377,7 @@ def get_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
         ticker_obj = yf.Ticker(ticker)
         calendar = ticker_obj.calendar
         if calendar is not None and not calendar.empty:
-            earnings_date = calendar.get("Earnings Date")
+            earnings_date = calendar.get('Earnings Date')
             if earnings_date is not None:
                 # Returns a list/range, take first date
                 if isinstance(earnings_date, (list, tuple)) and len(earnings_date) > 0:
@@ -407,9 +392,7 @@ def get_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
 earnings_date = get_earnings_date(TICKER)
 if earnings_date:
     days_to_earnings = (earnings_date - today).days
-    print(
-        f"📅 Next earnings: {earnings_date.strftime('%Y-%m-%d')} ({days_to_earnings} days)"
-    )
+    print(f"📅 Next earnings: {earnings_date.strftime('%Y-%m-%d')} ({days_to_earnings} days)")
 else:
     print(f"📅 Earnings date: Not available")
 
@@ -793,9 +776,9 @@ def generate_exit_strategy(
             'warnings': List[str],  # Any special warnings
         }
     """
-    dte = position.get("dte", 30)
-    liquidity_score = position.get("liquidity_score", 50)
-    exp_date = position.get("exp_date")
+    dte = position.get('dte', 30)
+    liquidity_score = position.get('liquidity_score', 50)
+    exp_date = position.get('exp_date')
 
     warnings = []
 
@@ -822,7 +805,7 @@ def generate_exit_strategy(
     # Calculate exit date
     if exp_date and isinstance(exp_date, pd.Timestamp):
         exit_date = exp_date - pd.Timedelta(days=exit_dte)
-        exit_date_str = exit_date.strftime("%m/%d")
+        exit_date_str = exit_date.strftime('%m/%d')
     else:
         exit_date_str = f"{exit_dte}d before expiry"
 
@@ -831,27 +814,21 @@ def generate_exit_strategy(
 
     # Rule 3: Earnings considerations
     if earnings_date and exp_date:
-        if isinstance(exp_date, pd.Timestamp) and isinstance(
-            earnings_date, pd.Timestamp
-        ):
+        if isinstance(exp_date, pd.Timestamp) and isinstance(earnings_date, pd.Timestamp):
             days_to_earnings = (earnings_date - pd.Timestamp.today()).days
 
             # If expiry is after earnings and earnings is soon
             if exp_date > earnings_date and 0 < days_to_earnings < 14:
-                warnings.append(
-                    f"⚠️ Earnings in {days_to_earnings}d - IV crush risk after announcement"
-                )
+                warnings.append(f"⚠️ Earnings in {days_to_earnings}d - IV crush risk after announcement")
                 if days_to_earnings < 7:
-                    warnings.append(
-                        "Consider exiting BEFORE earnings unless targeting the move"
-                    )
+                    warnings.append("Consider exiting BEFORE earnings unless targeting the move")
 
     return {
-        "exit_dte": exit_dte,
-        "exit_date": exit_date_str,
-        "reason": reason,
-        "profit_target": profit_target,
-        "warnings": warnings,
+        'exit_dte': exit_dte,
+        'exit_date': exit_date_str,
+        'reason': reason,
+        'profit_target': profit_target,
+        'warnings': warnings
     }
 
 
@@ -985,9 +962,9 @@ def recommend_optimal_hedge(
 
                 # Generate exit strategy
                 temp_position = {
-                    "dte": best_put["dte"],
-                    "liquidity_score": best_put["liquidity_score"],
-                    "exp_date": best_put["exp_date"],
+                    'dte': best_put["dte"],
+                    'liquidity_score': best_put["liquidity_score"],
+                    'exp_date': best_put["exp_date"]
                 }
                 exit_strategy = generate_exit_strategy(temp_position, earnings_date)
 
@@ -1218,32 +1195,31 @@ def recommend_full_protection_hedge(
 
         # Generate exit strategy
         temp_position = {
-            "dte": put_option["dte"],
-            "liquidity_score": put_option["liquidity_score"],
-            "exp_date": put_option["exp_date"],
+            'dte': put_option["dte"],
+            'liquidity_score': put_option["liquidity_score"],
+            'exp_date': put_option["exp_date"]
         }
         exit_strategy = generate_exit_strategy(temp_position, earnings_date)
 
-        recommendations.append(
-            {
-                "strike": put_option["strike"],
-                "premium": put_option["premium"],
-                "contracts": contracts,
-                "dte": put_option["dte"],
-                "exp_date": put_option["exp_date"],
-                "expiration": put_option["expiration"],
-                "cost": position_cost,
-                "commission": commission_cost,
-                "total_cost": total_position_cost,
-                "efficiency_score": put_option["efficiency_score"],
-                "prob_itm": put_option["prob_itm"],
-                "protection_per_dollar": put_option["protection_per_dollar"],
-                "protection_at_target": position_protection,
-                "liquidity_score": put_option["liquidity_score"],
-                "exit_strategy": exit_strategy,
-                "phase": "Coverage (Short-term)",
-            }
-        )
+        recommendations.append({
+            "strike": put_option["strike"],
+            "premium": put_option["premium"],
+            "contracts": contracts,
+            "dte": put_option["dte"],
+            "liquidity_score": put_option["liquidity_score"],
+            "exp_date": put_option["exp_date"],
+            "expiration": put_option["expiration"],
+            "cost": position_cost,
+            "commission": commission_cost,
+            "total_cost": total_position_cost,
+            "efficiency_score": put_option["efficiency_score"],
+            "prob_itm": put_option["prob_itm"],
+            "protection_per_dollar": put_option["protection_per_dollar"],
+            "protection_at_target": position_protection,
+            "liquidity_score": put_option["liquidity_score"],
+            "exit_strategy": exit_strategy,
+            "phase": "Coverage (Short-term)"
+        })
 
         total_cost += total_position_cost
         total_protection += position_protection
@@ -1456,30 +1432,22 @@ print(f"  Drift assumption: {DRIFT_RATE * 100:.1f}% annually")
 if recommendations:
     print(f"\n✅ Recommended Hedge Positions ({len(recommendations)}):")
     for i, rec in enumerate(recommendations, 1):
-        print(
-            f"  {i}. {rec['dte']}d Put @ ${rec['strike']:.2f} × {rec['contracts']} contracts"
-        )
+        print(f"  {i}. {rec['dte']}d Put @ ${rec['strike']:.2f} × {rec['contracts']} contracts")
 
         # Show costs with commission breakdown
-        gross_cost = rec.get("cost", 0)
-        commission = rec.get("commission", 0)
-        total = rec.get("total_cost", gross_cost + commission)
-        print(
-            f"     Cost: ${gross_cost:.0f} + ${commission:.2f} commission = ${total:.2f} total"
-        )
-        print(
-            f"     ITM Prob: {rec['prob_itm'] * 100:.1f}% |  Liquidity: {rec.get('liquidity_score', 0):.0f}/100"
-        )
+        gross_cost = rec.get('cost', 0)
+        commission = rec.get('commission', 0)
+        total = rec.get('total_cost', gross_cost + commission)
+        print(f"     Cost: ${gross_cost:.0f} + ${commission:.2f} commission = ${total:.2f} total")
+        print(f"     ITM Prob: {rec['prob_itm']*100:.1f}% |  Liquidity: {rec.get('liquidity_score', 0):.0f}/100")
 
         # Show exit strategy
-        if "exit_strategy" in rec:
-            exit_strat = rec["exit_strategy"]
+        if 'exit_strategy' in rec:
+            exit_strat = rec['exit_strategy']
             print(f"     📤 Exit Strategy: {exit_strat['reason']}")
-            print(
-                f"        Target exit: {exit_strat['exit_date']} ({exit_strat['exit_dte']} DTE)"
-            )
-            if exit_strat.get("warnings"):
-                for warning in exit_strat["warnings"]:
+            print(f"        Target exit: {exit_strat['exit_date']} ({exit_strat['exit_dte']} DTE)")
+            if exit_strat.get('warnings'):
+                for warning in exit_strat['warnings']:
                     print(f"        {warning}")
 else:
     print("\n⚠️  No eligible put options found for the configured filters.")
